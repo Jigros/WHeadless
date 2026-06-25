@@ -1292,11 +1292,44 @@ class BotController {
       this.logger.warn('cashout_nickname is not configured');
       return false;
     }
+    
     const amount = Math.floor(result.balance);
     if (amount <= 0) return false;
-    this.bot.chat(`/pay ${cashoutNickname} ${amount}`);
-    const msg = `💸 \`${this.displayName()}\` successfully transferred **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\``;
-    this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}`);
+
+    // Временный слушатель чата, чтобы поймать ответ сервера (ошибку при переводе)
+    const replyListener = (jsonMsg) => {
+      try {
+        const { collectStrings, stripMinecraftFormatting } = require('./utils');
+        const text = collectStrings(jsonMsg, { maxDepth: 10 }).join(' ');
+        const rawText = stripMinecraftFormatting(text).trim();
+        // Игнорируем обычный чат игроков
+        if (rawText && !rawText.startsWith('<') && !rawText.startsWith('[') && rawText.length > 5) {
+          this.logger.warn(`[Pay Reply ${this.displayName()}] ${rawText}`);
+          if (rawText.toLowerCase().includes('cannot') || rawText.toLowerCase().includes('error') || rawText.toLowerCase().includes('must') || rawText.toLowerCase().includes('limit')) {
+            this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` Ошибка Cashout: **${rawText}**`);
+          }
+        }
+      } catch(e) {}
+    };
+    this.bot.on('message', replyListener);
+    setTimeout(() => this.bot.removeListener('message', replyListener), 6000);
+
+    let remaining = amount;
+    const MAX_CHUNK = 50000000;
+    let chunkCount = 0;
+    
+    while (remaining > 0) {
+      const chunk = Math.min(remaining, MAX_CHUNK);
+      this.bot.chat(`/pay ${cashoutNickname} ${chunk}`);
+      this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${chunk}`);
+      remaining -= chunk;
+      chunkCount++;
+      if (remaining > 0) {
+        await sleep(2000 + Math.floor(Math.random() * 1000));
+      }
+    }
+
+    const msg = `💸 \`${this.displayName()}\` command sent for **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`${chunkCount > 1 ? ` (in ${chunkCount} chunks)` : ''}`;
     this.manager.dashboard?.sendLog(msg);
     return true;
   }
