@@ -47,7 +47,7 @@
     "proxy_bad_failure_threshold": 3,
     "reconnect_min_ms": 45000,
     "reconnect_max_ms": 60000,
-    "reconnect_on_kick": false,
+    "reconnect_on_kick": true,
     "scheduled_reconnect_enabled": true,
     "scheduled_reconnect_interval_ms": 86400000,
     "scheduled_reconnect_jitter_ms": 1800000,
