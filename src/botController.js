@@ -500,16 +500,19 @@ class BotController {
     }
 
     if (kind === 'kicked' && lowerReason.includes('already online')) {
-      this.pausedAuto = true;
-      this.setStatus('Ghost Session / Manual Reset');
+      this.clearReconnectTimer();
+      this.setStatus('Ghost Session / Wait 1m');
+      this.logger.warn('Ghost session detected; auto-reconnecting in 1 minute');
+      this.reconnectTimer = setTimeout(() => this.connect(), 60000);
       return;
     }
 
     if (kind === 'kicked' && (lowerReason.includes('make a ticket') || lowerReason.includes("don't know what happened"))) {
       this.ticketRetryAt = Date.now() + (12 * 60 * 1000);
-      this.pausedAuto = true;
+      this.clearReconnectTimer();
       this.setStatus('Server Ticket / Wait 12m');
-      this.logger.warn('Ticket-style kick detected; avoid reconnecting this account for at least 12 minutes');
+      this.logger.warn('Ticket-style kick detected; auto-reconnecting in 12 minutes');
+      this.reconnectTimer = setTimeout(() => this.connect(), 12 * 60 * 1000);
       return;
     }
 
@@ -1296,40 +1299,45 @@ class BotController {
     const amount = Math.floor(result.balance);
     if (amount <= 0) return false;
 
-    // Временный слушатель чата, чтобы поймать ответ сервера (ошибку при переводе)
+    let hasError = false;
+    let lastErrorMsg = '';
+
     const replyListener = (jsonMsg) => {
       try {
         const { collectStrings, stripMinecraftFormatting } = require('./utils');
         const text = collectStrings(jsonMsg, { maxDepth: 10 }).join(' ');
         const rawText = stripMinecraftFormatting(text).trim();
-        // Игнорируем обычный чат игроков
         if (rawText && !rawText.startsWith('<') && !rawText.startsWith('[') && rawText.length > 5) {
-          this.logger.warn(`[Pay Reply ${this.displayName()}] ${rawText}`);
           if (rawText.toLowerCase().includes('cannot') || rawText.toLowerCase().includes('error') || rawText.toLowerCase().includes('must') || rawText.toLowerCase().includes('limit')) {
-            this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` Ошибка Cashout: **${rawText}**`);
+            hasError = true;
+            lastErrorMsg = rawText;
           }
         }
       } catch(e) {}
     };
-    this.bot.on('message', replyListener);
-    setTimeout(() => this.bot.removeListener('message', replyListener), 6000);
 
-    let remaining = amount;
-    const MAX_CHUNK = 50000000;
-    let chunkCount = 0;
+    this.bot.on('message', replyListener);
+
+    this.bot.chat(`/pay ${cashoutNickname} ${amount}`);
+    this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}`);
     
-    while (remaining > 0) {
-      const chunk = Math.min(remaining, MAX_CHUNK);
-      this.bot.chat(`/pay ${cashoutNickname} ${chunk}`);
-      this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${chunk}`);
-      remaining -= chunk;
-      chunkCount++;
-      if (remaining > 0) {
-        await sleep(2000 + Math.floor(Math.random() * 1000));
+    await sleep(4000); // Ждем ответ сервера
+    
+    if (hasError) {
+      this.logger.warn(`Cashout error caught: ${lastErrorMsg}. Retrying...`);
+      hasError = false; // сбрасываем для второй попытки
+      this.bot.chat(`/pay ${cashoutNickname} ${amount}`);
+      await sleep(4000);
+      
+      if (hasError) {
+        this.manager.dashboard?.sendLog(`❌ \`${this.displayName()}\` failed to cashout. Error: **${lastErrorMsg}**`);
+        this.bot.removeListener('message', replyListener);
+        return false;
       }
     }
 
-    const msg = `💸 \`${this.displayName()}\` command sent for **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`${chunkCount > 1 ? ` (in ${chunkCount} chunks)` : ''}`;
+    this.bot.removeListener('message', replyListener);
+    const msg = `💸 \`${this.displayName()}\` successfully transferred **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\``;
     this.manager.dashboard?.sendLog(msg);
     return true;
   }
