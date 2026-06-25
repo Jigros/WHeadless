@@ -114,6 +114,7 @@ class BotController {
     this.balanceLabel = '-';
     this.axeLabel = '-';
     this.axeAlerted = false;
+    this.axeWarning1hSent = false;
     this.pausedAuto = false;
     this.userPaused = false;
     this.disconnectHandled = false;
@@ -1349,6 +1350,20 @@ class BotController {
       this.handleAxeUnavailable(result.reason);
       return false;
     }
+    
+    if (result.timer && result.timer.ms != null) {
+      if (result.timer.ms <= 3600000 && result.timer.ms > 0) {
+        if (!this.axeWarning1hSent) {
+          this.axeWarning1hSent = true;
+          const msg = `⚠️ \`${this.displayName()}\` Axe expires in **less than 1 hour**! пинг @everyone`;
+          this.logger.warn(`Axe expires in < 1h for ${this.displayName()}`);
+          this.manager.dashboard?.sendLog(msg);
+        }
+      } else if (result.timer.ms > 3600000) {
+        this.axeWarning1hSent = false;
+      }
+    }
+
     this.axeAlerted = false;
     if (this.status === 'Waiting Axe') this.setStatus('Ready');
     return true;
