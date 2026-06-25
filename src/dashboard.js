@@ -1208,6 +1208,18 @@ class Dashboard {
     if (!this.ready || this.refreshing) return;
     this.refreshing = true;
     try {
+      const cashoutTarget = this.config.cashout_nickname || '';
+      if (cashoutTarget) {
+        const result = await this.manager.donutApi.getBalance(cashoutTarget, { botKey: 'dashboard', displayName: 'Dashboard' });
+        if (result.ok && Number.isFinite(result.balance)) {
+          this.targetBalanceLabel = `$${formatCompactMoney(result.balance)}`;
+        } else {
+          this.targetBalanceLabel = '?';
+        }
+      } else {
+        this.targetBalanceLabel = '-';
+      }
+
       if (!this.message) await this.ensureDashboardMessage();
       await this.message.edit({
         embeds: [this.buildEmbed()],
@@ -1255,6 +1267,7 @@ class Dashboard {
     const ts = Math.floor(Date.now() / 1000);
     const desc = `${lines}\n\n**Updated:** <t:${ts}:R>`;
     const cashoutTarget = this.config.cashout_nickname || 'None';
+    const targetBalanceStr = this.targetBalanceLabel && this.targetBalanceLabel !== '-' ? ` (${this.targetBalanceLabel})` : '';
 
     const embed = new EmbedBuilder()
       .setTitle('WHeadless Control Center')
@@ -1266,7 +1279,7 @@ class Dashboard {
         { name: 'Paused', value: String(paused), inline: true },
         { name: 'Total Balance', value: `💰 $${formatCompactMoney(totalBalance)}`, inline: true },
         { name: 'Total Income', value: `📈 $${formatCompactMoney(totalPerHour)}/h ($${formatCompactMoney(totalPerHour * 24)}/d)`, inline: true },
-        { name: 'Cashout Target', value: `🎯 \`${cashoutTarget}\``, inline: true }
+        { name: 'Cashout Target', value: `🎯 \`${cashoutTarget}\`${targetBalanceStr}`, inline: true }
       );
 
     return embed;
