@@ -1528,7 +1528,7 @@ class BotController {
     this.setStatus('Waiting Axe');
     if (!this.axeAlerted) {
       this.axeAlerted = true;
-      this.manager.alertCritical(this, `Axe unavailable: ${reason || 'missing'}`);
+      this.manager.alertCritical(this, `Axe unavailable: ${reason || 'missing'} пинг @everyone`);
     }
   }
 

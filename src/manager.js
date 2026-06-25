@@ -37,8 +37,16 @@ class Manager {
       this.logger.error('Discord dashboard failed to start', error);
     });
 
+    this.logger.info('Waiting 45 seconds for ghost sessions to clear before connecting bots...');
+    let delayMs = 45000;
+    
     for (const controller of this.controllers) {
-      controller.start();
+      setTimeout(() => {
+        if (this.started) {
+          controller.start();
+        }
+      }, delayMs);
+      delayMs += 10000;
     }
   }
 
