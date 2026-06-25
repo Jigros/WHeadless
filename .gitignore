@@ -6,6 +6,8 @@ pnpm-debug.log*
 
 .env
 config.json
+test_dig.js
+minimal_bot.js
 
 auth/
 profiles/
