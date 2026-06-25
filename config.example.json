@@ -1,0 +1,126 @@
+{
+  "server": {
+    "host": "donutsmp.net",
+    "port": 25565,
+    "version": "1.21.1",
+    "target_cardinal_direction": "NORTH",
+    "pitch_degrees": -89,
+    "accept_resource_pack": false,
+    "resource_pack_policy": "deny",
+    "exploit_protection": true,
+    "close_forced_sign_editor": false,
+    "early_client_information": true,
+    "brand": "vanilla",
+    "locale": "en_us",
+    "view_distance": 12
+  },
+  "auth": {
+    "profiles_folder": "./auth/profiles"
+  },
+  "discord": {
+    "dashboard_channel_id": "replace_with_channel_id",
+    "log_channel_id": "replace_with_channel_id",
+    "dashboard_message_id": "",
+    "allowed_user_ids": [],
+    "alert_mention": ""
+  },
+  "donut_api": {
+    "base_url": "https://api.donutsmp.net/v1/stats",
+    "api_key": "",
+    "balance_json_path": ""
+  },
+  "cashout_nickname": "YourCashoutAccount",
+  "whitelist": [
+    "YourMinecraftName"
+  ],
+  "proxy": null,
+  "bot_defaults": {
+    "attack_interval_ms": 150,
+    "axe_scan_interval_ms": 60000,
+    "balance_interval_ms": 300000,
+    "profit_window_ms": 300000,
+    "profit_warmup_ms": 300000,
+    "profit_reference_per_hour": 47500000,
+    "profit_alert_drop_percent": 10,
+    "profit_alert_cooldown_ms": 600000,
+    "proxy_bad_failure_window_ms": 900000,
+    "proxy_bad_failure_threshold": 3,
+    "reconnect_min_ms": 45000,
+    "reconnect_max_ms": 60000,
+    "reconnect_on_kick": false,
+    "scheduled_reconnect_enabled": true,
+    "scheduled_reconnect_interval_ms": 86400000,
+    "scheduled_reconnect_jitter_ms": 1800000,
+    "scheduled_reconnect_busy_retry_ms": 300000,
+    "teleport_wait_ms": 6500,
+    "post_spawn_grace_ms": 8000,
+    "farming_enabled": true,
+    "packet_trace_limit": 120,
+    "farm_reach_blocks": 4.5,
+    "auto_eat_enabled": true,
+    "auto_eat_min_food": 18,
+    "auto_eat_critical_food": 8,
+    "auto_eat_interval_ms": 1000,
+    "auto_eat_retry_ms": 1500,
+    "player_alert_enabled": true,
+    "player_alert_interval_ms": 2000,
+    "player_alert_cooldown_ms": 300000,
+    "home_recovery_enabled": true,
+    "home_recovery_stuck_seconds": 10,
+    "home_recovery_move_threshold_blocks": 1,
+    "home_recovery_first_home_delay_seconds": 2,
+    "home_recovery_retry_start_minutes": 5,
+    "home_recovery_retry_random_step_minutes": 3,
+    "home_recovery_retry_max_minutes": 30,
+    "home_recovery_command_wait_seconds": 8,
+    "cursor_fallback_enabled": true,
+    "cursor_fallback_yaw_degrees": [
+      0,
+      2,
+      -2,
+      4,
+      -4,
+      8,
+      -8,
+      12,
+      -12
+    ],
+    "cursor_fallback_pitch_degrees": [
+      0,
+      2,
+      -2,
+      4,
+      -4,
+      8,
+      -8,
+      12,
+      -12,
+      18,
+      -18,
+      24,
+      -24
+    ],
+    "target_block_names": [
+      "chest",
+      "trapped_chest",
+      "hopper",
+      "barrel"
+    ],
+    "target_cycle_enabled": true,
+    "send_arm_animation": true,
+    "same_target_block_dig_interval_ms": 425,
+    "home_trade_command": "/home 2",
+    "home_farm_command": "/home 1",
+    "axe_names": [
+      "Shard Sell Axe"
+    ]
+  },
+  "bots": [
+    {
+      "username": "account@example.com",
+      "nickname": "",
+      "stats_username": "",
+      "proxy": null
+    }
+  ]
+}

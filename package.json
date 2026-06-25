@@ -1,0 +1,23 @@
+{
+  "name": "donut-headless-bot-manager",
+  "version": "1.0.0",
+  "description": "Headless Mineflayer bot manager with a Discord live dashboard for Donut SMP.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node -e \"const fs=require('node:fs');const cp=require('node:child_process');for(const f of fs.readdirSync('src').filter((x)=>x.endsWith('.js')).map((x)=>'src/'+x)){const r=cp.spawnSync(process.execPath,['--check',f],{stdio:'inherit'});if(r.status)process.exit(r.status);}\""
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.7",
+    "https-proxy-agent": "^7.0.5",
+    "mineflayer": "^4.29.0",
+    "socks": "^2.8.4",
+    "socks-proxy-agent": "^8.0.5"
+  }
+}
