@@ -95,6 +95,7 @@ const DEFAULT_CONFIG = {
     home_recovery_move_threshold_blocks: 0.2,
     home_recovery_ignore_passive_movement: true,
     home_recovery_discord_cooldown_ms: 600000,
+    home_recovery_restart_disconnect_silence_ms: 900000,
     home_recovery_first_home_delay_seconds: 2,
     home_recovery_retry_start_minutes: 5,
     home_recovery_retry_random_step_minutes: 3,

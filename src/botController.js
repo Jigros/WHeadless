@@ -84,6 +84,7 @@ const HOME_RECOVERY = {
   monitoring: 'monitoring',
   delayBeforeHome: 'delay-before-home',
   waitHomeResult: 'wait-home-result',
+  waitRestart: 'wait-restart',
   waitServerReturn: 'wait-server-return'
 };
 
@@ -161,6 +162,8 @@ class BotController {
     this.homeRecoveryLastMessage = '';
     this.homeRecoveryLastPosition = null;
     this.homeRecoveryLastMovedAt = 0;
+    this.homeRecoveryExpectedRestartUntil = 0;
+    this.homeRecoverySuppressStuckAlertUntil = 0;
     this.lastFarmActivityAt = 0;
     this.homeRecoveryHomeCommandSentAt = 0;
     this.homeRecoveryStuckAfterHomeAlerted = false;
@@ -442,6 +445,10 @@ class BotController {
 
   async returnHomeAfterSpawn() {
     if (this.settings.spawn_home_enabled === false) return;
+    if (this.homeRecoveryExpectedRestartUntil && Date.now() < this.homeRecoveryExpectedRestartUntil) {
+      this.logger.info('Spawn home skipped during expected server restart/update window');
+      return;
+    }
     const command = this.normalizedHomeCommand();
     if (!command) return;
     const now = Date.now();
@@ -535,11 +542,14 @@ class BotController {
       return;
     }
 
-    let emoji = '🔌';
-    if (kind === 'kicked') emoji = '🚫';
-    if (kind === 'error') emoji = '❌';
-    const display = this.displayName();
-    this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\``);
+    const suppressExpectedRestartDisconnect = this.shouldSuppressExpectedRestartDisconnect(classification, lowerReason);
+    if (!suppressExpectedRestartDisconnect) {
+      let emoji = '🔌';
+      if (kind === 'kicked') emoji = '🚫';
+      if (kind === 'error') emoji = '❌';
+      const display = this.displayName();
+      this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\``);
+    }
 
     if (kind === 'kicked' && lowerReason.includes('already online')) {
       this.clearReconnectTimer();
@@ -558,13 +568,21 @@ class BotController {
       return;
     }
 
-    if (kind === 'kicked' && !this.settings.reconnect_on_kick) {
+    if (kind === 'kicked' && !suppressExpectedRestartDisconnect && !this.settings.reconnect_on_kick) {
       this.pausedAuto = true;
       this.setStatus('Kicked / Reconnect Paused');
       return;
     }
 
     this.scheduleReconnect(kind);
+  }
+
+  shouldSuppressExpectedRestartDisconnect(classification, lowerReason) {
+    if (!this.homeRecoveryExpectedRestartUntil || Date.now() > this.homeRecoveryExpectedRestartUntil) return false;
+    const category = classification && classification.category;
+    if (category === 'Network' || category === 'Proxy') return true;
+    const lower = String(lowerReason || '').toLowerCase();
+    return lower.includes('timed out') || lower.includes('timeout') || lower.includes('socketclosed') || lower.includes('econnreset');
   }
 
   handleAuthCodeExpired(reasonText) {
@@ -961,6 +979,9 @@ class BotController {
       case HOME_RECOVERY.waitHomeResult:
         if (now >= this.homeRecoveryActionAt) this.scheduleHomeRecoveryRetry();
         break;
+      case HOME_RECOVERY.waitRestart:
+        this.tickHomeRecoveryRestartWait(now);
+        break;
       case HOME_RECOVERY.waitServerReturn:
         this.tickHomeRecoveryServerReturn(now);
         break;
@@ -986,17 +1007,23 @@ class BotController {
   }
 
   tickHomeRecoveryServerReturn(now) {
-    if (this.updateHomeRecoveryMovement(now)) {
-      if (this.homeRecoveryMaintenanceStartedAt > 0) {
-        this.notifyHomeRecovery(`Server returned bot after ${formatDuration(now - this.homeRecoveryMaintenanceStartedAt)}.`, true);
-      }
-      this.finishHomeRecovery('server-return');
-      return;
+    this.updateHomeRecoveryMovement(now);
+    const reach = Math.max(1, Number(this.settings.farm_reach_blocks) || 4.5);
+    if (!this.findAttackTargets(reach).length) return;
+    if (this.homeRecoveryMaintenanceStartedAt > 0) {
+      this.notifyHomeRecovery(`Server returned bot after ${formatDuration(now - this.homeRecoveryMaintenanceStartedAt)}.`, true);
     }
+    this.finishHomeRecovery('server-return');
+  }
 
-    const stuckMs = this.getHomeRecoveryStuckMs();
-    if (!this.homeRecoveryLastMovedAt || now - this.homeRecoveryLastMovedAt < stuckMs) return;
-    this.beginHomeRecoveryDelay(`${this.homeRecoveryInactivityReason(stuckMs)} after server return`);
+  tickHomeRecoveryRestartWait(now) {
+    this.updateHomeRecoveryMovement(now);
+    const reach = Math.max(1, Number(this.settings.farm_reach_blocks) || 4.5);
+    if (!this.findAttackTargets(reach).length) return;
+    if (this.homeRecoveryMaintenanceStartedAt > 0) {
+      this.notifyHomeRecovery(`Server returned bot after ${formatDuration(now - this.homeRecoveryMaintenanceStartedAt)}.`, true);
+    }
+    this.finishHomeRecovery('server-return');
   }
 
   shouldPauseHomeRecoveryMovementCheck() {
@@ -1105,20 +1132,26 @@ class BotController {
   scheduleHomeRecoveryRetry() {
     this.alertHomeRecoveryStillStuck();
     const minutes = this.nextHomeRecoveryRetryMinutes();
-    this.homeRecoveryState = HOME_RECOVERY.delayBeforeHome;
-    this.homeRecoveryActionAt = Date.now() + minutes * 60000;
     const label = this.homeRecoveryMaintenanceStartedAt > 0 ? 'Maintenance Retry' : 'Home Retry';
-    this.setStatus(`${label} (${minutes}m)`);
+    this.scheduleHomeRecoveryRetryIn(minutes, label, 'retry');
+  }
+
+  scheduleHomeRecoveryRetryIn(minutes, label = 'Home Retry', cooldownKey = 'retry') {
+    const retryMinutes = Math.max(1, Number(minutes) || 1);
+    this.homeRecoveryState = HOME_RECOVERY.delayBeforeHome;
+    this.homeRecoveryActionAt = Date.now() + retryMinutes * 60000;
+    this.setStatus(`${label} (${retryMinutes}m)`);
     this.notifyHomeRecovery(
-      `Next ${this.normalizedHomeCommand()} retry in ${minutes} minute(s).`,
+      `Next ${this.normalizedHomeCommand()} retry in ${retryMinutes} minute(s).`,
       true,
-      { cooldownKey: 'retry', cooldownMs: this.getHomeRecoveryDiscordCooldownMs() }
+      { cooldownKey, cooldownMs: this.getHomeRecoveryDiscordCooldownMs() }
     );
   }
 
   alertHomeRecoveryStillStuck() {
     if (this.homeRecoveryStuckAfterHomeAlerted) return;
     if (this.homeRecoveryMaintenanceStartedAt > 0) return;
+    if (this.homeRecoverySuppressStuckAlertUntil && Date.now() < this.homeRecoverySuppressStuckAlertUntil) return;
     if (!this.homeRecoveryHomeCommandSentAt) return;
     this.homeRecoveryStuckAfterHomeAlerted = true;
     this.manager.alertCritical(
@@ -1164,6 +1197,8 @@ class BotController {
       return;
     }
     if (lower.includes(SERVER_UPDATING_MARKER)) {
+      this.markHomeRecoveryExpectedRestart();
+      this.enterHomeRecoveryRestartWait('Server updating; waiting without teleport.');
       this.logThrottled('home-recovery-server-updating', `Home Recovery: server update warning: ${text}`, 30000);
       return;
     }
@@ -1182,24 +1217,27 @@ class BotController {
 
   handleHomeRecoveryProxyLimbo(message) {
     this.homeRecoveryLastMessage = message;
+    this.markHomeRecoveryExpectedRestart();
     if (this.homeRecoveryMaintenanceStartedAt <= 0) {
       this.homeRecoveryMaintenanceStartedAt = Date.now();
       this.notifyHomeRecovery(`Proxy limbo/restart detected: ${message}`, true);
     }
-    this.beginHomeRecoveryDelay('Proxy limbo/restart chat detected');
+    this.enterHomeRecoveryRestartWait('Proxy limbo/restart; waiting without teleport.');
   }
 
   handleHomeRecoveryMaintenance(message) {
     this.homeRecoveryLastMessage = message;
+    this.markHomeRecoveryExpectedRestart();
     if (this.homeRecoveryMaintenanceStartedAt <= 0) {
       this.homeRecoveryMaintenanceStartedAt = Date.now();
       this.notifyHomeRecovery(`Maintenance detected: ${message}`, true);
     }
-    this.scheduleHomeRecoveryRetry();
+    this.enterHomeRecoveryRestartWait('Maintenance detected; waiting without teleport.');
   }
 
   handleHomeRecoveryServerReturning(message) {
     this.homeRecoveryLastMessage = message;
+    this.markHomeRecoveryExpectedRestart();
     if (this.homeRecoveryMaintenanceStartedAt <= 0) {
       this.homeRecoveryMaintenanceStartedAt = Date.now();
       this.notifyHomeRecovery(`Server return detected: ${message}`, true);
@@ -1208,6 +1246,23 @@ class BotController {
     this.homeRecoveryActionAt = 0;
     this.markHomeRecoveryMovement();
     this.setStatus('Server Return Wait');
+  }
+
+  markHomeRecoveryExpectedRestart() {
+    const silenceMs = Math.max(60 * 1000, Number(this.settings.home_recovery_restart_disconnect_silence_ms) || 15 * 60 * 1000);
+    const until = Date.now() + silenceMs;
+    this.homeRecoveryExpectedRestartUntil = Math.max(this.homeRecoveryExpectedRestartUntil || 0, until);
+    this.homeRecoverySuppressStuckAlertUntil = Math.max(this.homeRecoverySuppressStuckAlertUntil || 0, until);
+  }
+
+  enterHomeRecoveryRestartWait(reason) {
+    this.stopAttack(true);
+    this.homeRecoveryState = HOME_RECOVERY.waitRestart;
+    this.homeRecoveryActionAt = 0;
+    this.homeRecoveryHomeCommandSentAt = 0;
+    this.markHomeRecoveryMovement();
+    this.setStatus('Restart Wait');
+    this.logThrottled('home-recovery-restart-wait', `Home Recovery: ${reason}`, 30000);
   }
 
   handleHomeRecoverySuccess(message) {
@@ -1244,6 +1299,8 @@ class BotController {
     this.homeRecoveryLastMessage = '';
     this.homeRecoveryHomeCommandSentAt = 0;
     this.homeRecoveryStuckAfterHomeAlerted = false;
+    this.homeRecoverySuppressStuckAlertUntil = 0;
+    this.homeRecoveryExpectedRestartUntil = 0;
   }
 
   normalizedHomeCommand() {
