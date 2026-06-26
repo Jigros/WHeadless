@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   Client,
@@ -460,7 +461,8 @@ class Dashboard {
       components.push(new ActionRowBuilder().addComponents(select));
     }
     components.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('dashboard:script_logs').setLabel('Refresh Files').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId('dashboard:script_logs').setLabel('Refresh Files').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('scriptlog:download_recent').setLabel('Download Recent Logs').setStyle(ButtonStyle.Primary)
     ));
     return {
       content: [
@@ -477,12 +479,18 @@ class Dashboard {
   buildScriptLogFilePayload(fileName, notice = '') {
     const file = this.listScriptLogFiles().find((item) => item.name === fileName);
     if (!file) return this.buildScriptLogsHomePayload('Log file was not found.');
-    const lines = this.readTailLines(file.path, 45, 256 * 1024);
-    const body = lines.length
-      ? lines.map((line) => `\`${this.discordChoiceText(line, 280).replace(/`/g, 'ʼ')}\``).join('\n')
+    const lines = this.readTailLines(file.path, 120, 512 * 1024);
+    const previewLines = this.fitDiscordLogPreview(lines, 1250);
+    const omitted = Math.max(0, lines.length - previewLines.length);
+    const body = previewLines.length
+      ? [
+          omitted ? `_Preview shows the newest lines; ${omitted} older preview line(s) omitted._` : '',
+          ...previewLines.map((line) => `\`${this.discordChoiceText(line, 220).replace(/`/g, 'ʼ')}\``)
+        ].filter(Boolean).join('\n')
       : '_Log file is empty._';
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`scriptlog:refresh:${file.name}`).setLabel('Refresh Log').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`scriptlog:download:${file.name}`).setLabel('Download Full').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('dashboard:script_logs').setLabel('Back').setStyle(ButtonStyle.Secondary)
     );
     return {
@@ -490,6 +498,8 @@ class Dashboard {
         notice,
         `**Script Log: ${file.label}**`,
         `File: \`${file.name}\``,
+        `Size: \`${file.sizeLabel}\``,
+        'Discord message preview is limited; use **Download Full** for the complete file.',
         '',
         body
       ].filter((line) => line !== '').join('\n').slice(0, 1900),
@@ -498,7 +508,7 @@ class Dashboard {
   }
 
   listScriptLogFiles() {
-    const dir = path.join(process.cwd(), 'logs', 'script');
+    const dir = this.scriptLogsDir();
     try {
       if (!fs.existsSync(dir)) return [];
       return fs.readdirSync(dir)
@@ -519,6 +529,10 @@ class Dashboard {
       this.logger.warn(`Failed to list script logs: ${error.message || error}`);
       return [];
     }
+  }
+
+  scriptLogsDir() {
+    return path.join(process.cwd(), 'logs', 'script');
   }
 
   scriptLogLabel(fileName, fallbackTimeMs) {
@@ -588,6 +602,95 @@ class Dashboard {
     }
   }
 
+  fitDiscordLogPreview(lines, maxChars) {
+    const out = [];
+    let used = 0;
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = this.discordChoiceText(lines[index], 220).replace(/`/g, 'ʼ');
+      const cost = line.length + 4;
+      if (out.length && used + cost > maxChars) break;
+      out.unshift(lines[index]);
+      used += cost;
+    }
+    return out;
+  }
+
+  scriptLogFileByName(fileName) {
+    return this.listScriptLogFiles().find((item) => item.name === fileName) || null;
+  }
+
+  async sendScriptLogAttachment(interaction, fileName) {
+    const file = this.scriptLogFileByName(fileName);
+    if (!file || !fs.existsSync(file.path)) {
+      await interaction.reply({ content: 'Log file was not found.', flags: 64 });
+      return;
+    }
+
+    const maxUploadBytes = 24 * 1024 * 1024;
+    const stat = fs.statSync(file.path);
+    if (stat.size > maxUploadBytes) {
+      await interaction.reply({
+        content: `Log file is too large for Discord upload (${this.formatBytes(stat.size)}). Path: \`${file.path}\``,
+        flags: 64
+      });
+      return;
+    }
+
+    const attachment = new AttachmentBuilder(file.path, { name: file.name });
+    await interaction.reply({
+      content: `Full script log: \`${file.name}\` (${file.sizeLabel})`,
+      files: [attachment],
+      flags: 64
+    });
+  }
+
+  async sendRecentScriptLogsAttachment(interaction) {
+    const files = this.listScriptLogFiles().slice(0, 25);
+    if (!files.length) {
+      await interaction.reply({ content: 'No script log files found.', flags: 64 });
+      return;
+    }
+
+    const maxUploadBytes = 24 * 1024 * 1024;
+    let totalBytes = 0;
+    const chunks = [];
+    let included = 0;
+    let truncated = false;
+
+    for (const file of files) {
+      const header = `\n\n===== ${file.name} (${file.sizeLabel}) =====\n`;
+      const body = fs.readFileSync(file.path, 'utf8');
+      const nextBytes = Buffer.byteLength(header) + Buffer.byteLength(body);
+      if (totalBytes + nextBytes > maxUploadBytes) {
+        if (included === 0) {
+          await interaction.reply({
+            content: `Newest log file is too large for Discord upload (${file.sizeLabel}). Use the server file directly: \`${file.path}\``,
+            flags: 64
+          });
+          return;
+        }
+        truncated = true;
+        break;
+      }
+      chunks.unshift(header, body);
+      totalBytes += nextBytes;
+      included += 1;
+    }
+
+    const note = truncated
+      ? `Included newest ${included} file(s); older files skipped because of Discord upload limit.`
+      : `Included ${included} recent file(s).`;
+    const content = `${note}\n${chunks.join('')}`;
+    const attachment = new AttachmentBuilder(Buffer.from(content, 'utf8'), {
+      name: `script-logs-recent-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`
+    });
+    await interaction.reply({
+      content: `${note} Size: \`${this.formatBytes(Buffer.byteLength(content))}\``,
+      files: [attachment],
+      flags: 64
+    });
+  }
+
   async handleInteraction(interaction) {
     if (!interaction.isButton() && !interaction.isStringSelectMenu()) return;
     
@@ -618,6 +721,19 @@ class Dashboard {
       if (!this.userAllowed(interaction.user.id)) return interaction.reply({ content: 'Not allowed.', flags: 64 });
       const fileName = interaction.customId.slice('scriptlog:refresh:'.length);
       await interaction.update(this.buildScriptLogFilePayload(fileName, 'Refreshed.'));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('scriptlog:download:')) {
+      if (!this.userAllowed(interaction.user.id)) return interaction.reply({ content: 'Not allowed.', flags: 64 });
+      const fileName = interaction.customId.slice('scriptlog:download:'.length);
+      await this.sendScriptLogAttachment(interaction, fileName);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'scriptlog:download_recent') {
+      if (!this.userAllowed(interaction.user.id)) return interaction.reply({ content: 'Not allowed.', flags: 64 });
+      await this.sendRecentScriptLogsAttachment(interaction);
       return;
     }
 

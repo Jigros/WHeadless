@@ -4,7 +4,7 @@ const { BotController } = require('./botController');
 const { Dashboard } = require('./dashboard');
 const { DonutApi } = require('./donutApi');
 const { getProxyLabel } = require('./proxy');
-const { writeJsonFile } = require('./utils');
+const { formatCompactMoney, writeJsonFile } = require('./utils');
 
 class Manager {
   constructor(config, logger) {
@@ -14,6 +14,8 @@ class Manager {
     this.dashboard = new Dashboard(config, this, logger.child('dashboard'));
     this.controllers = [];
     this.commandCooldown = new Map();
+    this.profitAlertQueue = [];
+    this.profitAlertTimer = null;
     this.started = false;
   }
 
@@ -52,8 +54,56 @@ class Manager {
 
   async shutdown() {
     this.logger.info('Shutting down manager');
+    if (this.profitAlertTimer) clearTimeout(this.profitAlertTimer);
+    this.profitAlertTimer = null;
+    this.profitAlertQueue = [];
     await Promise.allSettled(this.controllers.map((controller) => controller.shutdown()));
     await this.dashboard.shutdown();
+  }
+
+  queueProfitAlert(controller, alert) {
+    this.profitAlertQueue.push({
+      name: controller.displayName(),
+      shortPerHour: Number(alert.shortPerHour) || 0,
+      reference: Number(alert.reference) || 0,
+      percent: Number(alert.percent) || 0,
+      windowMs: Number(alert.windowMs) || 0,
+      earned: Number(alert.earned) || 0,
+      samples: Number(alert.samples) || 0
+    });
+
+    if (this.profitAlertTimer) return;
+    const batchMs = Math.max(
+      1000,
+      Number(controller.settings && controller.settings.profit_alert_batch_ms) ||
+        Number(this.config.bot_defaults && this.config.bot_defaults.profit_alert_batch_ms) ||
+        60000
+    );
+    this.profitAlertTimer = setTimeout(() => this.flushProfitAlerts(), batchMs);
+  }
+
+  flushProfitAlerts() {
+    const alerts = this.profitAlertQueue.splice(0);
+    this.profitAlertTimer = null;
+    if (!alerts.length) return;
+
+    if (alerts.length === 1) {
+      const alert = alerts[0];
+      this.dashboard?.sendLog([
+        `📉 \`${alert.name}\` sales dropped.`,
+        `Now: \`$${formatCompactMoney(alert.shortPerHour)}/h\``,
+        `Reference: \`$${formatCompactMoney(alert.reference)}/h\``,
+        alert.windowMs ? `Window: \`${Math.round(alert.windowMs / 60000)}m\`` : '',
+        alert.samples ? `Samples: \`${alert.samples}\`` : '',
+        `Drop: \`${Math.round(alert.percent)}%\``
+      ].filter(Boolean).join(' '));
+      return;
+    }
+
+    const lines = alerts.map((alert) => (
+      `- \`${alert.name}\`: now \`$${formatCompactMoney(alert.shortPerHour)}/h\`, reference \`$${formatCompactMoney(alert.reference)}/h\`, window \`${Math.round(alert.windowMs / 60000) || '?'}m\`, samples \`${alert.samples || '?'}\`, drop \`${Math.round(alert.percent)}%\``
+    ));
+    this.dashboard?.sendLog(`📉 Sales dropped for ${alerts.length} bots:\n${lines.join('\n')}`);
   }
 
   getSnapshots() {
@@ -76,24 +126,45 @@ class Manager {
   }
 
   getProfitReferencePerHour(sourceController = null) {
-    const configured = Number(
-      sourceController && sourceController.settings
-        ? sourceController.settings.profit_reference_per_hour
-        : this.config.bot_defaults.profit_reference_per_hour
-    ) || 47500000;
+    const settings = sourceController && sourceController.settings
+      ? sourceController.settings
+      : (this.config.bot_defaults || {});
+    const configured = Number(settings.profit_reference_per_hour) || 47500000;
+    const minPeerCount = Math.max(1, Number(settings.profit_reference_min_peer_count) || 2);
+    const useConfiguredFloor = settings.profit_reference_use_configured_floor === true;
 
+    const now = Date.now();
     const rates = this.controllers
       .filter((controller) => controller !== sourceController)
-      .filter((controller) => controller.profitReady && Number(controller.shortPerHour) > 0)
-      .map((controller) => Number(controller.shortPerHour))
+      .filter((controller) => controller.profitReady)
+      .map((controller) => this.controllerProfitReferenceRate(controller, now))
+      .filter((rate) => rate > 0)
       .sort((a, b) => a - b);
 
-    if (!rates.length) return configured;
+    if (rates.length < minPeerCount) return configured;
     const mid = Math.floor(rates.length / 2);
     const median = rates.length % 2 === 1
       ? rates[mid]
       : (rates[mid - 1] + rates[mid]) / 2;
-    return Math.max(configured, median);
+    return useConfiguredFloor ? Math.max(configured, median) : median;
+  }
+
+  controllerProfitReferenceRate(controller, now = Date.now()) {
+    if (!controller) return 0;
+    try {
+      if (typeof controller.calculateWindowStats === 'function' && typeof controller.getProfitAlertWindowMs === 'function') {
+        const windowMs = controller.getProfitAlertWindowMs();
+        const stats = controller.calculateWindowStats(now, windowMs);
+        const minSamples = Math.max(2, Number(controller.settings && controller.settings.profit_alert_min_samples) || 4);
+        const coverage = Math.max(10, Math.min(100, Number(controller.settings && controller.settings.profit_alert_min_coverage_percent) || 70));
+        if (stats.samples >= minSamples && stats.spanMs >= windowMs * (coverage / 100) && stats.perHour > 0) {
+          return Number(stats.perHour) || 0;
+        }
+      }
+    } catch (error) {
+      this.logger.debug(`Profit reference rate fallback for ${controller.displayName()}: ${error.message || error}`);
+    }
+    return Number(controller.shortPerHour) || 0;
   }
 
   async checkAllAxes() {

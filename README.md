@@ -360,7 +360,7 @@ Per-bot proxy:
 
 On spawn, each bot waits `post_spawn_grace_ms`, aligns to `server.target_cardinal_direction` and `server.pitch_degrees`, starts balance/axe polling, enters a minecart if required, then farms only while holding a configured axe.
 
-Home recovery watches movement. If the bot does not move for `home_recovery_stuck_seconds`, it sends `home_farm_command` (`/home 1` by default). If chat reports maintenance/limbo, it retries `/home` with the configured retry delay until home succeeds.
+Home recovery watches recent farming actions first. When `home_recovery_ignore_passive_movement` is enabled, water/current movement does not count as recovery while the farming loop is active; the bot must actually attempt farming within `home_recovery_stuck_seconds`. Repeated Discord recovery notices are limited by `home_recovery_discord_cooldown_ms`. If chat reports maintenance/limbo, it retries `/home` with the configured retry delay until home succeeds.
 
 Scheduled reconnect is enabled by default. Each bot reconnects after `scheduled_reconnect_interval_ms` (`24h`) plus up to `scheduled_reconnect_jitter_ms` (`30m`) so long-running sessions refresh without every account reconnecting at once. If a bot is eating, trading, respawning, or in home recovery, the scheduled reconnect is retried after `scheduled_reconnect_busy_retry_ms`.
 

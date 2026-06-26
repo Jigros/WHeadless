@@ -142,6 +142,10 @@ class BotController {
     this.proxyFailureTimes = [];
     this.chatLog = [];
     this.tpaInProgress = false;
+    this.pendingTpaSender = '';
+    this.tpaAcceptedNotified = false;
+    this.tpaAttemptNotified = false;
+    this.tpaFailureNotified = false;
     this.returnResolver = null;
     this.ticketRetryAt = 0;
     this.isEating = false;
@@ -154,8 +158,10 @@ class BotController {
     this.homeRecoveryLastMessage = '';
     this.homeRecoveryLastPosition = null;
     this.homeRecoveryLastMovedAt = 0;
+    this.lastFarmActivityAt = 0;
     this.homeRecoveryHomeCommandSentAt = 0;
     this.homeRecoveryStuckAfterHomeAlerted = false;
+    this.lastHomeRecoveryDiscordAt = new Map();
     
     this.sessionEarned = 0;
     this.sessionStartTime = Date.now();
@@ -166,6 +172,9 @@ class BotController {
     this.shortPerHour = 0;
     this.profitReady = false;
     this.lastProfitAlertAt = 0;
+    this.profitAlertActive = false;
+    this.profitAlertLowCount = 0;
+    this.profitAlertLastEvaluatedSampleAt = 0;
 
   }
 
@@ -941,7 +950,7 @@ class BotController {
     const stuckMs = this.getHomeRecoveryStuckMs();
     if (!this.homeRecoveryLastMovedAt || now - this.homeRecoveryLastMovedAt < stuckMs) return;
 
-    this.beginHomeRecoveryDelay(`No movement for ${Math.round(stuckMs / 1000)}s`);
+    this.beginHomeRecoveryDelay(this.homeRecoveryInactivityReason(stuckMs));
   }
 
   tickHomeRecoveryServerReturn(now) {
@@ -955,7 +964,7 @@ class BotController {
 
     const stuckMs = this.getHomeRecoveryStuckMs();
     if (!this.homeRecoveryLastMovedAt || now - this.homeRecoveryLastMovedAt < stuckMs) return;
-    this.beginHomeRecoveryDelay(`No movement for ${Math.round(stuckMs / 1000)}s after server return`);
+    this.beginHomeRecoveryDelay(`${this.homeRecoveryInactivityReason(stuckMs)} after server return`);
   }
 
   shouldPauseHomeRecoveryMovementCheck() {
@@ -972,7 +981,29 @@ class BotController {
 
   getHomeRecoveryMoveThreshold() {
     const blocks = Number(this.settings.home_recovery_move_threshold_blocks);
-    return Math.max(0.05, Number.isFinite(blocks) ? blocks : 1);
+    return Math.max(0.05, Number.isFinite(blocks) ? blocks : 0.2);
+  }
+
+  getHomeRecoveryDiscordCooldownMs() {
+    const cooldown = Number(this.settings.home_recovery_discord_cooldown_ms);
+    return Math.max(0, Number.isFinite(cooldown) ? cooldown : 10 * 60 * 1000);
+  }
+
+  getRecentFarmActivityAt(now = Date.now()) {
+    if (!this.lastFarmActivityAt) return 0;
+    const graceMs = this.getHomeRecoveryStuckMs();
+    return now - this.lastFarmActivityAt <= graceMs ? this.lastFarmActivityAt : 0;
+  }
+
+  shouldIgnorePassiveHomeRecoveryMovement() {
+    if (this.settings.home_recovery_ignore_passive_movement === false) return false;
+    return this.attackLoopActive || this.status === 'Farming';
+  }
+
+  homeRecoveryInactivityReason(stuckMs) {
+    const seconds = Math.round(stuckMs / 1000);
+    if (this.shouldIgnorePassiveHomeRecoveryMovement()) return `No farming activity for ${seconds}s`;
+    return `No movement for ${seconds}s`;
   }
 
   markHomeRecoveryMovement(now = Date.now()) {
@@ -983,6 +1014,13 @@ class BotController {
 
   updateHomeRecoveryMovement(now = Date.now()) {
     if (!this.bot || !this.bot.entity || !this.bot.entity.position) return false;
+    const activityAt = this.getRecentFarmActivityAt(now);
+    if (activityAt > 0) {
+      this.markHomeRecoveryMovement(activityAt);
+      return true;
+    }
+    if (this.shouldIgnorePassiveHomeRecoveryMovement()) return false;
+
     const position = this.bot.entity.position;
     if (!this.homeRecoveryLastPosition) {
       this.markHomeRecoveryMovement(now);
@@ -1004,7 +1042,11 @@ class BotController {
     this.homeRecoveryActionAt = Date.now() + delayMs;
     this.stopAttack(true);
     this.setStatus('Home Recovery');
-    this.notifyHomeRecovery(`${reason}. Sending ${this.normalizedHomeCommand()} in ${Math.round(delayMs / 1000)}s.`, true);
+    this.notifyHomeRecovery(
+      `${reason}. Sending ${this.normalizedHomeCommand()} in ${Math.round(delayMs / 1000)}s.`,
+      true,
+      { cooldownKey: 'start', cooldownMs: this.getHomeRecoveryDiscordCooldownMs() }
+    );
   }
 
   tryHomeRecoveryTeleport() {
@@ -1035,7 +1077,11 @@ class BotController {
     this.homeRecoveryActionAt = Date.now() + minutes * 60000;
     const label = this.homeRecoveryMaintenanceStartedAt > 0 ? 'Maintenance Retry' : 'Home Retry';
     this.setStatus(`${label} (${minutes}m)`);
-    this.notifyHomeRecovery(`Next ${this.normalizedHomeCommand()} retry in ${minutes} minute(s).`, true);
+    this.notifyHomeRecovery(
+      `Next ${this.normalizedHomeCommand()} retry in ${minutes} minute(s).`,
+      true,
+      { cooldownKey: 'retry', cooldownMs: this.getHomeRecoveryDiscordCooldownMs() }
+    );
   }
 
   alertHomeRecoveryStillStuck() {
@@ -1172,10 +1218,20 @@ class BotController {
     return String(this.settings.home_farm_command || '/home 1').trim();
   }
 
-  notifyHomeRecovery(message, discord = false) {
+  notifyHomeRecovery(message, discord = false, options = {}) {
     const line = `Home Recovery: ${message}`;
     this.logger.warn(line);
-    if (discord) this.manager.dashboard?.sendLog(`🏠 \`${this.displayName()}\` ${line}`);
+    if (!discord) return;
+
+    const cooldownKey = String(options.cooldownKey || '');
+    const cooldownMs = Math.max(0, Number(options.cooldownMs) || 0);
+    if (cooldownKey && cooldownMs > 0) {
+      const now = Date.now();
+      if ((this.lastHomeRecoveryDiscordAt.get(cooldownKey) || 0) + cooldownMs > now) return;
+      this.lastHomeRecoveryDiscordAt.set(cooldownKey, now);
+    }
+
+    this.manager.dashboard?.sendLog(`🏠 \`${this.displayName()}\` ${line}`);
   }
 
   async refreshBalance() {
@@ -1191,6 +1247,7 @@ class BotController {
         // Первое измерение баланса (бот только зашел)
         this.sessionStartTime = now;
         this.profitSamples = [{ at: now, balance: result.balance }];
+        this.resetProfitAlertState();
       } else if (result.balance > this.lastBalance) {
         // Второе и последующие измерения
         this.sessionEarned += (result.balance - this.lastBalance);
@@ -1204,6 +1261,7 @@ class BotController {
         this.shortPerHour = 0;
         this.profitReady = false;
         this.profitSamples = [{ at: now, balance: result.balance }];
+        this.resetProfitAlertState();
       } else {
         this.profitSamples.push({ at: now, balance: result.balance });
       }
@@ -1220,7 +1278,8 @@ class BotController {
   updateProfitMetrics(now = Date.now()) {
     const windowMs = Math.max(60 * 1000, Number(this.settings.profit_window_ms) || 5 * 60 * 1000);
     const warmupMs = Math.max(windowMs, Number(this.settings.profit_warmup_ms) || windowMs);
-    const keepAfter = now - Math.max(windowMs * 3, warmupMs + windowMs);
+    const alertWindowMs = this.getProfitAlertWindowMs();
+    const keepAfter = now - Math.max(windowMs * 3, alertWindowMs * 3, warmupMs + Math.max(windowMs, alertWindowMs));
     this.profitSamples = this.profitSamples
       .filter((sample) => sample && Number.isFinite(sample.balance) && Number.isFinite(sample.at) && sample.at >= keepAfter)
       .sort((a, b) => a.at - b.at);
@@ -1242,7 +1301,13 @@ class BotController {
   }
 
   calculateWindowRate(now, windowMs) {
-    if (!this.profitSamples.length) return 0;
+    return this.calculateWindowStats(now, windowMs).perHour;
+  }
+
+  calculateWindowStats(now, windowMs) {
+    if (!this.profitSamples.length) {
+      return { perHour: 0, earned: 0, spanMs: 0, samples: 0, newestAt: 0 };
+    }
     const newest = this.profitSamples[this.profitSamples.length - 1];
     let oldest = this.profitSamples[0];
     const cutoff = now - windowMs;
@@ -1250,10 +1315,32 @@ class BotController {
       if (sample.at <= cutoff) oldest = sample;
       else break;
     }
-    if (!oldest || newest.at <= oldest.at) return 0;
+    if (!oldest || newest.at <= oldest.at) {
+      return { perHour: 0, earned: 0, spanMs: 0, samples: this.profitSamples.length, newestAt: newest ? newest.at : 0 };
+    }
     const earned = newest.balance - oldest.balance;
-    if (earned <= 0) return 0;
-    return earned / ((newest.at - oldest.at) / 3600000);
+    const spanMs = newest.at - oldest.at;
+    const samples = this.profitSamples.filter((sample) => sample.at >= oldest.at && sample.at <= newest.at).length;
+    return {
+      perHour: earned > 0 ? earned / (spanMs / 3600000) : 0,
+      earned: Math.max(0, earned),
+      spanMs,
+      samples,
+      newestAt: newest.at
+    };
+  }
+
+  getProfitAlertWindowMs() {
+    const configured = Number(this.settings.profit_alert_window_ms);
+    const displayWindow = Math.max(60 * 1000, Number(this.settings.profit_window_ms) || 5 * 60 * 1000);
+    const balanceInterval = Math.max(60 * 1000, Number(this.settings.balance_interval_ms) || 5 * 60 * 1000);
+    return Math.max(displayWindow, balanceInterval * 3, Number.isFinite(configured) ? configured : 20 * 60 * 1000);
+  }
+
+  resetProfitAlertState() {
+    this.profitAlertActive = false;
+    this.profitAlertLowCount = 0;
+    this.profitAlertLastEvaluatedSampleAt = 0;
   }
 
   profitTrendIcon() {
@@ -1267,80 +1354,175 @@ class BotController {
   }
 
   checkProfitAlert(now = Date.now()) {
+    if (this.settings.profit_alert_enabled === false) return;
     if (!this.profitReady) return;
     const cooldownMs = Math.max(60 * 1000, Number(this.settings.profit_alert_cooldown_ms) || 10 * 60 * 1000);
-    if (this.lastProfitAlertAt + cooldownMs > now) return;
 
     const reference = this.manager.getProfitReferencePerHour(this);
     const dropPercent = Math.max(1, Number(this.settings.profit_alert_drop_percent) || 10);
     const threshold = reference * (1 - dropPercent / 100);
-    if (!reference || this.shortPerHour >= threshold) return;
+    if (!reference) return;
 
+    const alertWindowMs = this.getProfitAlertWindowMs();
+    const stats = this.calculateWindowStats(now, alertWindowMs);
+    const minSamples = Math.max(2, Number(this.settings.profit_alert_min_samples) || 4);
+    const minCoveragePercent = Math.max(10, Math.min(100, Number(this.settings.profit_alert_min_coverage_percent) || 70));
+    const minSpanMs = alertWindowMs * (minCoveragePercent / 100);
+    if (stats.samples < minSamples || stats.spanMs < minSpanMs) return;
+    if (stats.newestAt && stats.newestAt === this.profitAlertLastEvaluatedSampleAt) return;
+    this.profitAlertLastEvaluatedSampleAt = stats.newestAt || now;
+
+    if (stats.perHour >= threshold) {
+      this.profitAlertLowCount = 0;
+      const recoveryThreshold = reference * (1 - dropPercent / 200);
+      if (stats.perHour >= recoveryThreshold) this.profitAlertActive = false;
+      return;
+    }
+
+    this.profitAlertLowCount += 1;
+    if (this.profitAlertActive) return;
+    const confirmations = Math.max(1, Number(this.settings.profit_alert_confirmations) || 2);
+    if (this.profitAlertLowCount < confirmations) return;
+    if (this.lastProfitAlertAt + cooldownMs > now) return;
+
+    this.profitAlertActive = true;
     this.lastProfitAlertAt = now;
-    const msg = [
-      `📉 \`${this.displayName()}\` sales dropped.`,
-      `Now: \`$${formatCompactMoney(this.shortPerHour)}/h\``,
-      `Reference: \`$${formatCompactMoney(reference)}/h\``,
-      `Drop: \`${Math.round((1 - (this.shortPerHour / reference)) * 100)}%\``
-    ].join(' ');
-    this.logger.warn(`Profit alert: short=${formatCompactMoney(this.shortPerHour)}/h reference=${formatCompactMoney(reference)}/h`);
-    this.manager.dashboard?.sendLog(msg);
+    const percent = Math.round((1 - (stats.perHour / reference)) * 100);
+    this.logger.warn(`Profit alert: alertWindow=${formatDuration(alertWindowMs)} rate=${formatCompactMoney(stats.perHour)}/h reference=${formatCompactMoney(reference)}/h samples=${stats.samples}`);
+    if (typeof this.manager.queueProfitAlert === 'function') {
+      this.manager.queueProfitAlert(this, {
+        shortPerHour: stats.perHour,
+        reference,
+        percent,
+        windowMs: alertWindowMs,
+        earned: stats.earned,
+        samples: stats.samples
+      });
+    } else {
+      const msg = [
+        `📉 \`${this.displayName()}\` sales dropped.`,
+        `Now: \`$${formatCompactMoney(stats.perHour)}/h\``,
+        `Reference: \`$${formatCompactMoney(reference)}/h\``,
+        `Window: \`${formatDuration(alertWindowMs)}\``,
+        `Drop: \`${percent}%\``
+      ].join(' ');
+      this.manager.dashboard?.sendLog(msg);
+    }
   }
 
   async cashout() {
     if (!this.bot || this.disconnectHandled) return false;
-    const result = await this.refreshBalance();
-    if (!result.ok || !Number.isFinite(result.balance) || result.balance <= 0) return false;
+    const before = await this.refreshBalance();
+    if (!before.ok || !Number.isFinite(before.balance) || before.balance <= 0) return false;
     const cashoutNickname = String(this.config.cashout_nickname || '').trim();
     if (!cashoutNickname) {
       this.logger.warn('cashout_nickname is not configured');
       return false;
     }
     
-    const amount = Math.floor(result.balance);
+    const amount = Math.floor(before.balance);
     if (amount <= 0) return false;
 
-    let hasError = false;
-    let lastErrorMsg = '';
+    const payment = {
+      success: false,
+      error: false,
+      message: ''
+    };
 
     const replyListener = (jsonMsg) => {
       try {
-        const { collectStrings, stripMinecraftFormatting } = require('./utils');
         const text = collectStrings(jsonMsg, { maxDepth: 10 }).join(' ');
         const rawText = stripMinecraftFormatting(text).trim();
-        if (rawText && !rawText.startsWith('<') && !rawText.startsWith('[') && rawText.length > 5) {
-          if (rawText.toLowerCase().includes('cannot') || rawText.toLowerCase().includes('error') || rawText.toLowerCase().includes('must') || rawText.toLowerCase().includes('limit')) {
-            hasError = true;
-            lastErrorMsg = rawText;
-          }
-        }
+        const classified = classifyCashoutReply(rawText, cashoutNickname);
+        if (!classified) return;
+        if (classified.type === 'success') payment.success = true;
+        if (classified.type === 'error') payment.error = true;
+        payment.message = classified.message;
       } catch(e) {}
     };
 
     this.bot.on('message', replyListener);
+    this.bot.on('messagestr', replyListener);
+    try {
+      this.sendChat(`/pay ${cashoutNickname} ${amount}`);
+      this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}`);
 
-    this.bot.chat(`/pay ${cashoutNickname} ${amount}`);
-    this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}`);
-    
-    await sleep(4000); // Ждем ответ сервера
-    
-    if (hasError) {
-      this.logger.warn(`Cashout error caught: ${lastErrorMsg}. Retrying...`);
-      hasError = false; // сбрасываем для второй попытки
-      this.bot.chat(`/pay ${cashoutNickname} ${amount}`);
-      await sleep(4000);
-      
-      if (hasError) {
-        this.manager.dashboard?.sendLog(`❌ \`${this.displayName()}\` failed to cashout. Error: **${lastErrorMsg}**`);
-        this.bot.removeListener('message', replyListener);
+      const replyWaitMs = Math.max(1000, Number(this.settings.cashout_reply_wait_ms) || 5000);
+      await sleep(replyWaitMs);
+
+      if (payment.error) {
+        const reason = payment.message || 'server rejected payment';
+        this.logger.warn(`Cashout rejected: ${reason}`);
+        this.manager.dashboard?.sendLog(`❌ \`${this.displayName()}\` failed to cashout **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`. Reason: \`${reason.slice(0, 180)}\``);
         return false;
+      }
+    } finally {
+      this.bot?.removeListener('message', replyListener);
+      this.bot?.removeListener('messagestr', replyListener);
+    }
+
+    const verified = await this.verifyCashoutBalanceDrop(before.balance, amount);
+    if (verified.ok) {
+      const msg = [
+        `💸 \`${this.displayName()}\` transferred **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`.`,
+        `Verified: \`${verified.reason}\``,
+        Number.isFinite(verified.balance) ? `Balance now: \`$${formatCompactMoney(verified.balance)}\`` : ''
+      ].filter(Boolean).join(' ');
+      this.manager.dashboard?.sendLog(msg);
+      return true;
+    }
+
+    if (payment.success) {
+      const msg = [
+        `💸 \`${this.displayName()}\` transferred **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`.`,
+        `Verified: \`server reply\``,
+        payment.message ? `Reply: \`${payment.message.slice(0, 160)}\`` : ''
+      ].filter(Boolean).join(' ');
+      this.manager.dashboard?.sendLog(msg);
+      return true;
+    }
+
+    const lastBalance = Number.isFinite(verified.balance) ? `$${formatCompactMoney(verified.balance)}` : 'unknown';
+    const reason = verified.reason || 'no server success reply and source balance did not drop enough';
+    this.logger.warn(`Cashout unconfirmed amount=${amount} target=${cashoutNickname} balanceBefore=${before.balance} balanceAfter=${lastBalance} reason=${reason}`);
+    this.manager.dashboard?.sendLog(
+      `⚠️ \`${this.displayName()}\` cashout to \`${cashoutNickname}\` is **not confirmed**. Tried: **$${amount.toLocaleString('en-US')}**. Balance now: \`${lastBalance}\`. Reason: \`${reason}\``
+    );
+    return false;
+  }
+
+  async verifyCashoutBalanceDrop(beforeBalance, amount) {
+    const attempts = Math.max(1, Number(this.settings.cashout_verify_attempts) || 6);
+    const intervalMs = Math.max(1000, Number(this.settings.cashout_verify_interval_ms) || 5000);
+    const minDropRatio = Math.max(0.1, Math.min(1, Number(this.settings.cashout_verify_min_drop_ratio) || 0.8));
+    const requiredDrop = Math.max(1, amount * minDropRatio);
+    let lastBalance = null;
+    let lastCode = '';
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      if (attempt > 1) await sleep(intervalMs);
+      const result = await this.refreshBalance();
+      lastCode = result.code || '';
+      if (!result.ok || !Number.isFinite(result.balance)) continue;
+      lastBalance = result.balance;
+      const drop = beforeBalance - result.balance;
+      if (drop >= requiredDrop) {
+        return {
+          ok: true,
+          balance: result.balance,
+          reason: `balance drop $${formatCompactMoney(drop)}`
+        };
       }
     }
 
-    this.bot.removeListener('message', replyListener);
-    const msg = `💸 \`${this.displayName()}\` successfully transferred **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\``;
-    this.manager.dashboard?.sendLog(msg);
-    return true;
+    const drop = Number.isFinite(lastBalance) ? beforeBalance - lastBalance : 0;
+    return {
+      ok: false,
+      balance: lastBalance,
+      reason: Number.isFinite(lastBalance)
+        ? `balance drop only $${formatCompactMoney(Math.max(0, drop))}; required $${formatCompactMoney(requiredDrop)}`
+        : `balance verification unavailable${lastCode ? ` (${lastCode})` : ''}`
+    };
   }
 
   async checkAxe() {
@@ -1628,6 +1810,7 @@ class BotController {
     if (!chest) return;
 
     try {
+      this.markFarmActivity();
       // Сбрасываем зависшее копание, если оно застряло с прошлого раза
       if (this.bot.targetDigging) {
         this.bot.stopDigging();
@@ -1643,6 +1826,13 @@ class BotController {
       if (err.message !== 'Digging aborted' && err.message !== 'Block not in view') {
         this.logger.warn(`[Bot] Ошибка копания: ${err.message}`);
       }
+    }
+  }
+
+  markFarmActivity(now = Date.now()) {
+    this.lastFarmActivityAt = now;
+    if (this.homeRecoveryState === HOME_RECOVERY.monitoring && this.bot && this.bot.entity && this.bot.entity.position) {
+      this.markHomeRecoveryMovement(now);
     }
   }
 
@@ -1777,6 +1967,7 @@ class BotController {
 
   handleMessageString(message) {
     const text = stripMinecraftFormatting(message || '');
+    this.handleTpaProgressMessage(text);
     const sender = parseTpaSender(text) || this.findWhitelistedTpaSender(text);
     if (sender && this.manager.isWhitelisted(sender)) {
       this.handleTpa(sender).catch((error) => this.logger.warn('TPA handler failed', error));
@@ -1819,10 +2010,12 @@ class BotController {
   async handleTpa(sender) {
     if (this.tpaInProgress || !this.bot || this.disconnectHandled) return;
     this.tpaInProgress = true;
+    this.pendingTpaSender = sender;
+    this.tpaAcceptedNotified = false;
+    this.tpaAttemptNotified = false;
+    this.tpaFailureNotified = false;
     try {
-      const msg = `🤝 \`${this.displayName()}\` accepted TPA request from **${sender}**`;
-      this.logger.info(`Accepted TPA workflow for ${sender}`);
-      this.manager.dashboard?.sendLog(msg);
+      this.logger.info(`Starting TPA workflow for ${sender}`);
       this.stopAttack(true);
       this.setStatus('TPA Trade');
       this.sendChat(this.settings.home_trade_command);
@@ -1830,6 +2023,10 @@ class BotController {
       this.sendChat(`/tpaccept ${sender}`);
       await sleep(500);
       this.sendChat('/tpaccept');
+      await sleep(1500);
+      if (!this.tpaAcceptedNotified && !this.tpaFailureNotified) {
+        this.notifyTpaAttempt(sender);
+      }
       
       // Даем время на телепортацию
       this.setStatus('Waiting Return');
@@ -1839,9 +2036,47 @@ class BotController {
       await sleep(Number(this.settings.teleport_wait_ms) || 1000);
     } finally {
       this.tpaInProgress = false;
+      this.pendingTpaSender = '';
       if (this.status === 'TPA Trade' || this.status === 'Waiting Return') this.setStatus('Ready');
       this.startFarming();
     }
+  }
+
+  handleTpaProgressMessage(message) {
+    if (!this.tpaInProgress || !this.pendingTpaSender) return;
+    const text = stripMinecraftFormatting(message || '').trim();
+    if (!text) return;
+    const lower = text.toLowerCase();
+    if (isTpaFailureMessage(lower)) {
+      this.notifyTpaFailure(this.pendingTpaSender, text);
+      return;
+    }
+    if (isTpaAcceptedMessage(lower)) {
+      this.notifyTpaAccepted(this.pendingTpaSender, text);
+    }
+  }
+
+  notifyTpaAttempt(sender) {
+    if (this.tpaAttemptNotified || this.tpaAcceptedNotified || this.tpaFailureNotified) return;
+    this.tpaAttemptNotified = true;
+    this.logger.info(`TPA accept commands sent for ${sender}; no confirmation seen yet`);
+    this.manager.dashboard?.sendLog(`🤝 \`${this.displayName()}\` sent TPA accept for **${sender}**; waiting for server confirmation.`);
+  }
+
+  notifyTpaAccepted(sender, detail = '') {
+    if (this.tpaAcceptedNotified) return;
+    this.tpaAcceptedNotified = true;
+    const suffix = detail ? ` (${String(detail).slice(0, 160)})` : '';
+    this.logger.info(`TPA accepted for ${sender}${detail ? `: ${detail}` : ''}`);
+    this.manager.dashboard?.sendLog(`🤝 \`${this.displayName()}\` accepted TPA request from **${sender}**${suffix}`);
+  }
+
+  notifyTpaFailure(sender, detail = '') {
+    if (this.tpaFailureNotified || this.tpaAcceptedNotified) return;
+    this.tpaFailureNotified = true;
+    const reason = detail ? ` Reason: \`${String(detail).slice(0, 180)}\`` : '';
+    this.logger.warn(`TPA accept may have failed for ${sender}${detail ? `: ${detail}` : ''}`);
+    this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` TPA accept may have failed for **${sender}**.${reason}`);
   }
 
   findWhitelistedTpaSender(message) {
@@ -1872,12 +2107,16 @@ class BotController {
 
     // Авто-подтверждение TPA GUI (DonutSMP)
     if (this.tpaInProgress && window.slots) {
-      const confirmSlot = window.slots.find(item => item && (item.name.includes('lime_stained_glass_pane') || item.name.includes('green_stained_glass_pane')));
-      if (confirmSlot) {
-        this.logger.info(`Found TPA confirm GUI, clicking green button (slot ${confirmSlot.slot})`);
+      const confirmSlot = window.slots.findIndex((item) => {
+        const name = String(item && item.name || '');
+        return name.includes('lime_stained_glass_pane') || name.includes('green_stained_glass_pane');
+      });
+      if (confirmSlot >= 0) {
+        this.logger.info(`Found TPA confirm GUI, clicking green button (slot ${confirmSlot})`);
         try {
-          await this.bot.clickWindow(confirmSlot.slot, 0, 0);
+          await this.bot.clickWindow(confirmSlot, 0, 0);
           this.bot.closeWindow(window);
+          if (this.pendingTpaSender) this.notifyTpaAccepted(this.pendingTpaSender, 'confirmed TPA GUI');
           return;
         } catch (err) {
           this.logger.warn(`Failed to click TPA confirm button: ${err.message}`);
@@ -1974,6 +2213,103 @@ function parseTpaSender(message) {
 
 function looksLikeTpaMessage(message) {
   return /teleport|tpa|tpaccept|телепорт/i.test(String(message || ''));
+}
+
+function isTpaAcceptedMessage(lowerMessage) {
+  const text = String(lowerMessage || '').toLowerCase();
+  if (!looksLikeTpaMessage(text)) return false;
+  return (
+    text.includes('teleport request accepted') ||
+    text.includes('request accepted') ||
+    text.includes('you accepted') ||
+    text.includes('successfully accepted') ||
+    text.includes('accepted the teleport') ||
+    text.includes('accepted your teleport') ||
+    text.includes('принял запрос') ||
+    text.includes('запрос принят') ||
+    text.includes('принята')
+  );
+}
+
+function isTpaFailureMessage(lowerMessage) {
+  const text = String(lowerMessage || '').toLowerCase();
+  if (!looksLikeTpaMessage(text)) return false;
+  return (
+    text.includes('no pending') ||
+    text.includes('no teleport request') ||
+    text.includes('no tpa request') ||
+    text.includes('request expired') ||
+    text.includes('has expired') ||
+    text.includes('not found') ||
+    text.includes('not online') ||
+    text.includes('cancelled') ||
+    text.includes('canceled') ||
+    text.includes('denied') ||
+    text.includes('declined') ||
+    text.includes('нет актив') ||
+    text.includes('истек') ||
+    text.includes('отклон')
+  );
+}
+
+function classifyCashoutReply(message, targetNickname) {
+  const text = stripMinecraftFormatting(message || '').trim();
+  if (!text || text.startsWith('<')) return null;
+  const lower = text.toLowerCase();
+  const target = String(targetNickname || '').trim().toLowerCase();
+  const mentionsTarget = !target || lower.includes(target);
+  const looksPaymentRelated = /pay|paid|payment|transfer|sent|balance|money|\$|донат|перев|плат|баланс|денег/i.test(text);
+  if (!looksPaymentRelated && !mentionsTarget) return null;
+
+  const errorMarkers = [
+    'cannot',
+    'error',
+    'must',
+    'limit',
+    'insufficient',
+    'not enough',
+    'too low',
+    'minimum',
+    'invalid',
+    'unknown',
+    'not found',
+    'not online',
+    'usage',
+    'cooldown',
+    'failed',
+    'недостаточно',
+    'ошибка',
+    'нельзя',
+    'лимит',
+    'не найден',
+    'не в сети',
+    'миним'
+  ];
+  if (errorMarkers.some((marker) => lower.includes(marker))) {
+    return { type: 'error', message: text };
+  }
+
+  const successMarkers = [
+    'successfully paid',
+    'successfully transferred',
+    'payment sent',
+    'you paid',
+    'you have paid',
+    'you sent',
+    'transferred',
+    'paid',
+    'sent',
+    'перевел',
+    'перевёл',
+    'отправил',
+    'заплатил',
+    'успеш'
+  ];
+  if (mentionsTarget && successMarkers.some((marker) => lower.includes(marker))) {
+    return { type: 'success', message: text };
+  }
+
+  return null;
 }
 
 function escapeRegExp(value) {
