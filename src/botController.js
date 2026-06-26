@@ -492,12 +492,6 @@ class BotController {
       this.handleAuthCodeExpired(reasonText);
       return;
     }
-    
-    let emoji = '🔌';
-    if (kind === 'kicked') emoji = '🚫';
-    if (kind === 'error') emoji = '❌';
-    const display = this.displayName();
-    this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\``);
 
     if (this.userPaused) {
       this.setStatus('Paused');
@@ -508,6 +502,12 @@ class BotController {
       if (this.status !== 'Reconnecting') this.setStatus('Offline');
       return;
     }
+
+    let emoji = '🔌';
+    if (kind === 'kicked') emoji = '🚫';
+    if (kind === 'error') emoji = '❌';
+    const display = this.displayName();
+    this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\``);
 
     if (kind === 'kicked' && lowerReason.includes('already online')) {
       this.clearReconnectTimer();
