@@ -358,7 +358,7 @@ Per-bot proxy:
 
 ## Farming Behavior
 
-On spawn, each bot waits `post_spawn_grace_ms`, aligns to `server.target_cardinal_direction` and `server.pitch_degrees`, starts balance/axe polling, enters a minecart if required, then farms only while holding a configured axe.
+On spawn, each bot waits `post_spawn_grace_ms`, sends `home_farm_command` when `spawn_home_enabled` is enabled, waits `spawn_home_wait_ms`, aligns to `server.target_cardinal_direction` and `server.pitch_degrees`, starts balance/axe polling, then farms only while holding a configured axe.
 
 Home recovery watches recent farming actions first. When `home_recovery_ignore_passive_movement` is enabled, water/current movement does not count as recovery while the farming loop is active; the bot must actually attempt farming within `home_recovery_stuck_seconds`. Repeated Discord recovery notices are limited by `home_recovery_discord_cooldown_ms`. If chat reports maintenance/limbo, it retries `/home` with the configured retry delay until home succeeds.
 

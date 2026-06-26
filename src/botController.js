@@ -121,6 +121,8 @@ class BotController {
     this.manualClose = false;
     this.phase = 'idle';
     this.lastKickReason = '';
+    this.spawnHomeInProgress = false;
+    this.lastSpawnHomeAt = 0;
     this.lastMsaUserCode = '';
     this.lastMsaCodeAt = 0;
     this.announceNextLogin = Boolean(botConfig.announce_login_on_next_start);
@@ -421,6 +423,9 @@ class BotController {
     await sleep(Number(this.settings.post_spawn_grace_ms) || 8000);
     if (bot !== this.bot || this.disconnectHandled) return;
 
+    await this.returnHomeAfterSpawn();
+    if (bot !== this.bot || this.disconnectHandled) return;
+
     await this.lockFarmCamera();
     this.startBalancePolling();
     this.startAxePolling();
@@ -432,6 +437,32 @@ class BotController {
     const ok = await this.checkAxe();
     if (ok) {
       await this.startFarming();
+    }
+  }
+
+  async returnHomeAfterSpawn() {
+    if (this.settings.spawn_home_enabled === false) return;
+    const command = this.normalizedHomeCommand();
+    if (!command) return;
+    const now = Date.now();
+    const cooldownMs = Math.max(0, Number(this.settings.spawn_home_cooldown_ms) || 30000);
+    if (this.spawnHomeInProgress || (this.lastSpawnHomeAt && now - this.lastSpawnHomeAt < cooldownMs)) return;
+
+    this.spawnHomeInProgress = true;
+    this.lastSpawnHomeAt = now;
+    try {
+      this.setStatus('Spawn Home');
+      this.logger.info(`Spawn home: sending ${command}`);
+      this.sendChat(command);
+      const waitMs = Math.max(
+        1000,
+        Number(this.settings.spawn_home_wait_ms) ||
+          Number(this.settings.teleport_wait_ms) ||
+          6500
+      );
+      await sleep(waitMs);
+    } finally {
+      this.spawnHomeInProgress = false;
     }
   }
 
