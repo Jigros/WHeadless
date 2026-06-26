@@ -136,6 +136,7 @@ class BotController {
     this.nextScheduledReconnectAt = 0;
     this.noAxeTickCount = 0;
     this.lastBrokenFarmPosKey = null;
+    this.attackTargetCycleIndex = 0;
     this.lastTargetLogAt = 0;
     this.lastThrottleLog = new Map();
     this.lastPlayerAlertAt = new Map();
@@ -1781,6 +1782,7 @@ class BotController {
     this.attackLoopActive = false;
     this.attackTimer = null;
     this.lastBrokenFarmPosKey = null;
+    this.attackTargetCycleIndex = 0;
     if (this.isDigging()) {
       try { this.bot.stopDigging(); } catch (e) {}
     }
@@ -1801,16 +1803,14 @@ class BotController {
   async attackTick() {
     if (!this.bot || !this.bot.entity || this.disconnectHandled) return;
 
-    // Ищем сундук в радиусе 5 блоков (ТОЛЬКО сундуки, бочки, воронки)
-    const chest = this.bot.findBlock({
-      matching: (b) => b.name.includes('chest') || b.name.includes('barrel') || b.name.includes('hopper'),
-      maxDistance: 5
-    });
-
-    if (!chest) return;
+    const reach = Math.max(1, Number(this.settings.farm_reach_blocks) || 4.5);
+    const target = this.selectAttackTarget(reach);
+    if (!target) {
+      this.logNoTargetDiagnostics(reach);
+      return;
+    }
 
     try {
-      this.markFarmActivity();
       // Сбрасываем зависшее копание, если оно застряло с прошлого раза
       if (this.bot.targetDigging) {
         this.bot.stopDigging();
@@ -1820,13 +1820,85 @@ class BotController {
       if (typeof this.bot.swingArm === 'function') this.bot.swingArm('right');
 
       // bot.dig(блок, смотретьЛиНаБлок, типРейкаста) - строго как в minimal_bot.js (forceLook: true)
-      await this.bot.dig(chest, true, 'raycast');
+      await this.bot.dig(target, true, 'raycast');
+      this.markFarmActivity();
+      this.logTargetBlock(target, target);
 
     } catch (err) {
       if (err.message !== 'Digging aborted' && err.message !== 'Block not in view') {
         this.logger.warn(`[Bot] Ошибка копания: ${err.message}`);
       }
     }
+  }
+
+  selectAttackTarget(reach) {
+    const targets = this.findAttackTargets(reach);
+    if (!targets.length) return null;
+    if (this.settings.target_cycle_enabled === false) return targets[0];
+
+    this.attackTargetCycleIndex %= targets.length;
+    const target = targets[this.attackTargetCycleIndex];
+    this.attackTargetCycleIndex = (this.attackTargetCycleIndex + 1) % targets.length;
+    return target;
+  }
+
+  findAttackTargets(reach) {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return [];
+    const origin = this.bot.entity.position;
+    const maxDistance = Math.max(1, Math.ceil(Number(reach) || 5));
+    const targetsByInventory = new Map();
+    const seen = new Set();
+
+    for (let dy = -2; dy <= 2; dy += 1) {
+      for (let dx = -maxDistance; dx <= maxDistance; dx += 1) {
+        for (let dz = -maxDistance; dz <= maxDistance; dz += 1) {
+          const pos = origin.floored().offset(dx, dy, dz);
+          const key = this.blockPositionKey(pos);
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          const block = this.bot.blockAt(pos);
+          if (!this.isAllowedAttackBlock(block)) continue;
+
+          const center = block.position.offset(0.5, 0.5, 0.5);
+          const distance = origin.distanceTo(center);
+          if (!Number.isFinite(distance) || distance > reach + 0.75) continue;
+          const inventoryKey = this.attackTargetInventoryKey(block);
+          const previous = targetsByInventory.get(inventoryKey);
+          if (!previous || distance < previous.distance) {
+            targetsByInventory.set(inventoryKey, { block, distance, key: inventoryKey });
+          }
+        }
+      }
+    }
+
+    return [...targetsByInventory.values()]
+      .sort((a, b) => a.distance - b.distance || a.key.localeCompare(b.key))
+      .map((item) => item.block);
+  }
+
+  attackTargetInventoryKey(block) {
+    if (!block || !block.position) return '';
+    const name = String(block.name || '').toLowerCase();
+    const baseKey = `${name}:${this.blockPositionKey(block.position)}`;
+    if (!this.isDoubleChestBlockName(name) || !this.bot) return baseKey;
+
+    const adjacentKeys = [this.blockPositionKey(block.position)];
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const neighbor = this.bot.blockAt(block.position.offset(dx, 0, dz));
+      if (neighbor && String(neighbor.name || '').toLowerCase() === name) {
+        adjacentKeys.push(this.blockPositionKey(neighbor.position));
+      }
+    }
+
+    if (adjacentKeys.length <= 1) return baseKey;
+    adjacentKeys.sort();
+    return `${name}:${adjacentKeys.slice(0, 2).join('|')}`;
+  }
+
+  isDoubleChestBlockName(name) {
+    const normalized = String(name || '').toLowerCase();
+    return normalized === 'chest' || normalized === 'trapped_chest';
   }
 
   markFarmActivity(now = Date.now()) {
@@ -1864,9 +1936,8 @@ class BotController {
   }
 
   isFarmTargetBlockName(name) {
-    const normalized = String(name || '').toLowerCase();
-    if (normalized === 'ender_chest') return false;
-    return normalized.includes('chest') || normalized.includes('barrel') || normalized.includes('hopper');
+    const block = { name: String(name || '').toLowerCase(), position: { x: 0, y: 0, z: 0 } };
+    return this.isAllowedAttackBlock(block);
   }
 
   logNearbyTargets(reach) {

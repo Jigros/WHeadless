@@ -100,7 +100,7 @@ const DEFAULT_CONFIG = {
     cursor_fallback_enabled: true,
     cursor_fallback_yaw_degrees: [0, 2, -2, 4, -4, 8, -8, 12, -12],
     cursor_fallback_pitch_degrees: [0, 2, -2, 4, -4, 8, -8, 12, -12, 18, -18, 24, -24],
-    target_block_names: ['chest', 'trapped_chest', 'hopper', 'barrel'],
+    target_block_names: ['chest', 'trapped_chest', 'barrel'],
     target_cycle_enabled: true,
     suppress_idle_movement_packets: false,
     send_arm_animation: true,
