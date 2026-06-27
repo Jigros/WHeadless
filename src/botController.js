@@ -202,6 +202,7 @@ class BotController {
     this.profitAlertActive = false;
     this.profitAlertLowCount = 0;
     this.profitAlertLastEvaluatedSampleAt = 0;
+    this.kickRetryAttempt = false;
 
   }
 
@@ -409,6 +410,7 @@ class BotController {
       this.rememberProfileName(bot.username, 'login');
       this.lastMsaUserCode = '';
       this.lastMsaCodeAt = 0;
+      this.kickRetryAttempt = false;
       this.phase = 'play';
       this.setStatus('Logged In');
       const msg = `Microsoft account login successful: ${this.botConfig.username} -> ${this.displayName()}`;
@@ -667,15 +669,32 @@ class BotController {
     }
 
     const suppressExpectedRestartDisconnect = this.shouldSuppressExpectedRestartDisconnect(classification, lowerReason);
-    if (!suppressExpectedRestartDisconnect) {
+    
+    let isGhostSession = kind === 'kicked' && lowerReason.includes('already online');
+    let isSecurity = kind === 'kicked' && classification.category === 'Server Security';
+    let isTicket = kind === 'kicked' && (lowerReason.includes('make a ticket') || lowerReason.includes("don't know what happened"));
+
+    let fastRetry = false;
+    if ((kind === 'kicked' || kind === 'error') && !suppressExpectedRestartDisconnect && !isGhostSession && !isSecurity && !isTicket) {
+      if (!this.kickRetryAttempt) {
+        fastRetry = true;
+        this.kickRetryAttempt = true;
+      }
+    }
+
+    if (!suppressExpectedRestartDisconnect && !fastRetry) {
       let emoji = '🔌';
       if (kind === 'kicked') emoji = '🚫';
       if (kind === 'error') emoji = '❌';
       const display = this.displayName();
-      this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\`${this.disconnectDiagnosticSuffix(kind, reasonText, classification)}`);
+      
+      const isSpam = classification.category === 'Minecraft Profile' || classification.category === 'Minecraft Session';
+      if (!isSpam) {
+        this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\`${this.disconnectDiagnosticSuffix(kind, reasonText, classification)}`);
+      }
     }
 
-    if (kind === 'kicked' && lowerReason.includes('already online')) {
+    if (isGhostSession) {
       this.clearReconnectTimer();
       this.setStatus('Ghost Session / Wait 1m');
       this.logger.warn('Ghost session detected; auto-reconnecting in 1 minute');
@@ -683,7 +702,7 @@ class BotController {
       return;
     }
 
-    if (kind === 'kicked' && classification.category === 'Server Security') {
+    if (isSecurity) {
       this.clearReconnectTimer();
       this.pausedAuto = true;
       this.setStatus('Server Security / Discord Verify');
@@ -691,7 +710,7 @@ class BotController {
       return;
     }
 
-    if (kind === 'kicked' && (lowerReason.includes('make a ticket') || lowerReason.includes("don't know what happened"))) {
+    if (isTicket) {
       this.ticketRetryAt = Date.now() + (12 * 60 * 1000);
       this.clearReconnectTimer();
       this.setStatus('Server Ticket / Wait 12m');
@@ -703,6 +722,14 @@ class BotController {
     if (kind === 'kicked' && !suppressExpectedRestartDisconnect && !this.settings.reconnect_on_kick) {
       this.pausedAuto = true;
       this.setStatus('Kicked / Reconnect Paused');
+      return;
+    }
+
+    if (fastRetry) {
+      this.clearReconnectTimer();
+      this.setStatus('Fast Retry / Wait 10s');
+      this.logger.warn('Fast retry: waiting 10 seconds before reconnecting to clear temporary kicks');
+      this.reconnectTimer = setTimeout(() => this.connect(), 10000);
       return;
     }
 
@@ -1743,18 +1770,15 @@ class BotController {
 
   async refreshBalance() {
     const username = this.statsUsername();
-    let result = await this.donutApi.getBalance(username, {
-      botKey: this.botConfig.username,
-      displayName: this.displayName()
-    });
+    let result = await this.getGameBalance(username);
 
-    if (isTransientBalanceApiError(result)) {
-      const gameBalance = await this.getGameBalanceFallback(result);
-      if (gameBalance && gameBalance.ok) result = gameBalance;
+    if (!result || !result.ok) {
+      result = { ok: false, code: 'NO_BALANCE', label: '-', balance: null };
+    } else {
+      this.applyBalanceResult(result);
     }
-
-    this.applyBalanceResult(result);
-    this.balanceLabel = this.cachedBalanceLabelForTransientError(result) || result.label;
+    
+    this.balanceLabel = result.label;
     return result;
   }
 
@@ -2611,13 +2635,21 @@ class BotController {
       if (typeof this.bot.swingArm === 'function') this.bot.swingArm('right');
 
       this.recordFarmTarget(target);
-      await this.bot.dig(target, false, 'raycast');
+      
+      await Promise.race([
+        this.bot.dig(target, false, 'raycast'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Digging timed out')), 800))
+      ]);
+      
       this.markFarmActivity();
       this.recordFarmTarget(target);
       this.logTargetBlock(target, target);
 
     } catch (err) {
-      if (err.message !== 'Digging aborted' && err.message !== 'Block not in view') {
+      if (err.message === 'Digging aborted' || err.message === 'Digging timed out') {
+        // Серверный плагин на автопродажу отменяет копание сундука, либо просто не отвечает
+        this.markFarmActivity();
+      } else if (err.message !== 'Block not in view') {
         this.logger.warn(`[Bot] Ошибка копания: ${err.message}`);
       }
     }
