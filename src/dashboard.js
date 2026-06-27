@@ -594,7 +594,25 @@ class Dashboard {
     if (!text) return false;
     const kind = String(entry.kind || entry.position || entry.type || '').toLowerCase();
     if (kind === 'game_info' || kind === 'actionbar' || kind === 'action_bar') return false;
-    return !/^\$?\s*[\d,.]+(?:\s*[kmbt])?$/i.test(text);
+    return !this.isMoneyNoiseChatLine(text);
+  }
+
+  isMoneyNoiseChatLine(text) {
+    const value = String(text || '').replace(/\u00a7[0-9A-FK-OR]/gi, '').replace(/\s+/g, ' ').trim();
+    if (/^\$?\s*[\d,.]+(?:\s*[kmbt])?$/i.test(value)) return true;
+    if (!value.includes('$')) return false;
+    if (!/(#[0-9a-f]{6}|\bwhite\b|\bgray\b|\bgreen\b|\byellow\b|\bgold\b)/i.test(value)) return false;
+
+    const cleaned = value
+      .replace(/#[0-9a-f]{6}/gi, ' ')
+      .replace(/\b(?:black|dark_blue|dark_green|dark_aqua|dark_red|dark_purple|gold|gray|dark_gray|blue|green|aqua|red|light_purple|yellow|white|reset|bold|italic|underlined|strikethrough|obfuscated)\b/gi, ' ')
+      .replace(/\b0\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!cleaned) return false;
+
+    const tokens = cleaned.split(/\s+/).filter(Boolean);
+    return tokens.length > 0 && tokens.every((token) => token === '$' || /^[\d,.]+(?:[kmbt])?$/i.test(token));
   }
 
   safeLogName(value) {

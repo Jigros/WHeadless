@@ -50,6 +50,8 @@ const DEFAULT_CONFIG = {
     cashout_verify_interval_ms: 5000,
     cashout_verify_min_drop_ratio: 0.8,
     cashout_reconnect_on_unconfirmed: true,
+    cashout_retry_after_reconnect: true,
+    cashout_reconnect_retry_delay_ms: 5000,
     tpa_reconnect_on_no_confirmation: true,
     attack_interval_ms: 150,
     axe_scan_interval_ms: 60000,

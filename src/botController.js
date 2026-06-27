@@ -153,6 +153,7 @@ class BotController {
     this.tpaAttemptNotified = false;
     this.tpaFailureNotified = false;
     this.pendingCashout = null;
+    this.pendingCashoutRetry = null;
     this.returnResolver = null;
     this.ticketRetryAt = 0;
     this.isEating = false;
@@ -466,6 +467,9 @@ class BotController {
     if (ok) {
       await this.startFarming();
     }
+    this.runPendingCashoutRetry('spawn').catch((error) => {
+      this.logger.warn(`Cashout recovery retry failed: ${error.message || error}`);
+    });
   }
 
   async returnHomeAfterSpawn() {
@@ -863,6 +867,27 @@ class BotController {
     this.manager.dashboard?.sendLog(`♻️ \`${this.displayName()}\` reconnecting to recover stuck command channel. Reason: \`${discordInline(detail, 180)}\``);
     this.reconnectNow();
     return true;
+  }
+
+  queueCashoutRetryAfterReconnect(reason) {
+    this.pendingCashoutRetry = {
+      queuedAt: Date.now(),
+      reason: String(reason || 'cashout unconfirmed').slice(0, 240)
+    };
+    this.logger.warn(`Queued cashout retry after reconnect: ${this.pendingCashoutRetry.reason}`);
+  }
+
+  async runPendingCashoutRetry(source) {
+    const retry = this.pendingCashoutRetry;
+    if (!retry || !this.bot || this.disconnectHandled || this.userPaused) return false;
+    this.pendingCashoutRetry = null;
+
+    const delayMs = Math.max(1000, Number(this.settings.cashout_reconnect_retry_delay_ms) || 5000);
+    this.logger.warn(`Running queued cashout retry after ${source}; delay=${delayMs}ms reason=${retry.reason}`);
+    await sleep(delayMs);
+    if (!this.bot || this.disconnectHandled || this.userPaused) return false;
+
+    return this.cashout({ recoveryRetry: true });
   }
 
   async shutdown() {
@@ -1536,8 +1561,9 @@ class BotController {
     }
   }
 
-  async cashout() {
+  async cashout(options = {}) {
     if (!this.bot || this.disconnectHandled) return false;
+    const isRecoveryRetry = Boolean(options.recoveryRetry);
     if (this.pendingCashout) {
       this.logger.warn('Cashout skipped: another cashout is already in progress');
       return false;
@@ -1585,7 +1611,7 @@ class BotController {
       this.setStatus('Cashout');
       this.closeCurrentWindow('before cashout');
       this.sendChat(`/pay ${cashoutNickname} ${amount}`);
-      this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}`);
+      this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}${isRecoveryRetry ? ' (recovery retry)' : ''}`);
 
       const replyWaitMs = Math.max(1000, Number(this.settings.cashout_reply_wait_ms) || 5000);
       await sleep(replyWaitMs);
@@ -1624,6 +1650,9 @@ class BotController {
       this.manager.dashboard?.sendLog(
         `⚠️ \`${this.displayName()}\` cashout to \`${cashoutNickname}\` is **not confirmed**. Tried: **$${amount.toLocaleString('en-US')}**. Balance now: \`${lastBalance}\`. Reason: \`${discordInline(reason, 220)}\`${this.cashoutDiagnosticSuffix(payment)}`
       );
+      if (!isRecoveryRetry && this.settings.cashout_retry_after_reconnect !== false) {
+        this.queueCashoutRetryAfterReconnect(reason);
+      }
       if (this.settings.cashout_reconnect_on_unconfirmed !== false) {
         this.recoverCommandChannel(`cashout unconfirmed; ${reason}`);
       }
@@ -1676,10 +1705,14 @@ class BotController {
   cashoutDiagnosticSuffix(payment) {
     if (!payment) return '';
     const lines = [];
-    for (const reply of payment.replies || []) lines.push(reply);
+    for (const reply of payment.replies || []) {
+      if (!shouldShowMinecraftChatLine({ direction: 'IN', text: reply, kind: 'system' })) continue;
+      lines.push(reply);
+    }
     const startedAt = Number(payment.startedAt) || Date.now();
     for (const entry of this.chatLog.slice(-12)) {
       if (!entry || !entry.text || entry.at < startedAt - 2000) continue;
+      if (!shouldShowMinecraftChatLine(entry)) continue;
       const line = `${entry.direction}: ${entry.text}`;
       if (!lines.includes(line)) lines.push(line);
     }
@@ -2514,12 +2547,31 @@ function shouldShowMinecraftChatLine(entry) {
   const kind = normalizeChatKind(entry.kind || entry.position || entry.type || '');
   if (kind === 'game_info') return false;
   if (isMoneyOnlyChatLine(text)) return false;
+  if (isExpandedMoneyActionbarLine(text)) return false;
   return true;
 }
 
 function isMoneyOnlyChatLine(text) {
   const value = stripMinecraftFormatting(text || '').trim();
   return /^\$?\s*[\d,.]+(?:\s*[kmbt])?$/i.test(value);
+}
+
+function isExpandedMoneyActionbarLine(text) {
+  const value = stripMinecraftFormatting(text || '').replace(/\s+/g, ' ').trim();
+  if (!value || !value.includes('$')) return false;
+  if (!/(#[0-9a-f]{6}|\bwhite\b|\bgray\b|\bgreen\b|\byellow\b|\bgold\b)/i.test(value)) return false;
+
+  const cleaned = value
+    .replace(/#[0-9a-f]{6}/gi, ' ')
+    .replace(/\b(?:black|dark_blue|dark_green|dark_aqua|dark_red|dark_purple|gold|gray|dark_gray|blue|green|aqua|red|light_purple|yellow|white|reset|bold|italic|underlined|strikethrough|obfuscated)\b/gi, ' ')
+    .replace(/\b0\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return false;
+
+  const tokens = cleaned.split(/\s+/).filter(Boolean);
+  if (!tokens.length) return false;
+  return tokens.every((token) => token === '$' || /^[\d,.]+(?:[kmbt])?$/i.test(token));
 }
 
 function describeWindow(window) {
