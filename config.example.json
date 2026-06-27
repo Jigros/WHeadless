@@ -39,6 +39,8 @@
     "cashout_verify_attempts": 6,
     "cashout_verify_interval_ms": 5000,
     "cashout_verify_min_drop_ratio": 0.8,
+    "cashout_reconnect_on_unconfirmed": true,
+    "tpa_reconnect_on_no_confirmation": true,
     "attack_interval_ms": 150,
     "axe_scan_interval_ms": 60000,
     "balance_interval_ms": 300000,

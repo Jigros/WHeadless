@@ -25,6 +25,7 @@ const BUTTONS = {
   cashoutAll: 'dashboard:cashout-all',
   reconnectAll: 'dashboard:reconnect-all',
   offlineList: 'dashboard:offline-list',
+  farmCoords: 'dashboard:farm-coords',
   pause: 'dashboard:pause',
   resume: 'dashboard:resume'
 };
@@ -564,7 +565,7 @@ class Dashboard {
         .slice(-4);
       const entries = [];
       for (const file of files) {
-        const text = this.readTailLines(path.join(dir, file), 300, 128 * 1024).join('\n');
+        const text = this.readTailLines(path.join(dir, file), Math.max(300, limit * 12), 128 * 1024).join('\n');
         for (const line of text.split(/\r?\n/).filter(Boolean)) {
           try {
             const entry = JSON.parse(line);
@@ -572,11 +573,28 @@ class Dashboard {
           } catch (error) {}
         }
       }
-      return entries.slice(-limit);
+      return this.filterMinecraftChatEntries(entries, limit);
     } catch (error) {
       this.logger.warn(`Failed to read Minecraft chat logs: ${error.message || error}`);
       return [];
     }
+  }
+
+  filterMinecraftChatEntries(entries, limit = 25) {
+    const count = Math.max(1, Math.min(80, Number(limit) || 25));
+    return (entries || [])
+      .filter((entry) => this.shouldShowMinecraftChatLine(entry))
+      .slice(-count);
+  }
+
+  shouldShowMinecraftChatLine(entry) {
+    if (!entry || !entry.text) return false;
+    if (String(entry.direction || '').toUpperCase() === 'OUT') return true;
+    const text = String(entry.text || '').replace(/\u00a7[0-9A-FK-OR]/gi, '').trim();
+    if (!text) return false;
+    const kind = String(entry.kind || entry.position || entry.type || '').toLowerCase();
+    if (kind === 'game_info' || kind === 'actionbar' || kind === 'action_bar') return false;
+    return !/^\$?\s*[\d,.]+(?:\s*[kmbt])?$/i.test(text);
   }
 
   safeLogName(value) {
@@ -843,6 +861,8 @@ class Dashboard {
     if (interaction.customId === BUTTONS.refresh) {
       await this.refresh();
       reply = 'Dashboard refreshed.';
+    } else if (interaction.customId === BUTTONS.farmCoords) {
+      reply = this.buildFarmCoordsText();
     } else if (interaction.customId === BUTTONS.checkAll) {
       await this.manager.checkAllAxes();
       await this.refresh();
@@ -1406,16 +1426,40 @@ class Dashboard {
     return Number.isFinite(number) ? formatCompactMoney(number) : value;
   }
 
+  buildFarmCoordsText() {
+    const snapshots = this.manager.getSnapshots();
+    const lines = snapshots.map((bot) => {
+      const icon = bot.online ? '🟢' : '🔴';
+      const farm = bot.farm || {};
+      const botPos = this.formatVector(farm.bot);
+      const target = farm.target || null;
+      const targetPos = target && target.position ? `${target.name || 'block'} ${this.formatVector(target.position)}` : '-';
+      const seen = target && target.at ? `<t:${Math.floor(target.at / 1000)}:R>` : '-';
+      return `• ${icon} \`${bot.name}\` Bot: \`${botPos}\` Target: \`${targetPos}\` Seen: ${seen}`;
+    });
+    return ['**Farm Coordinates**', lines.length ? lines.join('\n') : 'No bots configured.'].join('\n').slice(0, 1900);
+  }
+
+  formatVector(position) {
+    if (!position) return '-';
+    const x = Number(position.x);
+    const y = Number(position.y);
+    const z = Number(position.z);
+    if (![x, y, z].every(Number.isFinite)) return '-';
+    return `${x}, ${y}, ${z}`;
+  }
+
   buildComponents() {
     return [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(BUTTONS.refresh).setLabel('Refresh').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('dashboard:manage_bot').setLabel('Manage Bots').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('dashboard:script_logs').setLabel('Script Logs').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('dashboard:set_cashout').setLabel('Set Target').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('dashboard:whitelist').setLabel('Whitelist').setStyle(ButtonStyle.Primary)
+        new ButtonBuilder().setCustomId(BUTTONS.farmCoords).setLabel('Farm Coords').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('dashboard:set_cashout').setLabel('Set Target').setStyle(ButtonStyle.Secondary)
       ),
       new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('dashboard:whitelist').setLabel('Whitelist').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(BUTTONS.cashoutAll).setLabel('Cashout All').setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId(BUTTONS.pause).setLabel('Pause').setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(BUTTONS.resume).setLabel('Resume').setStyle(ButtonStyle.Success)

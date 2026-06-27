@@ -145,11 +145,14 @@ class BotController {
     this.lastPlayerAlertAt = new Map();
     this.proxyFailureTimes = [];
     this.chatLog = [];
+    this.lastRecordedChatKey = '';
+    this.lastRecordedChatAt = 0;
     this.tpaInProgress = false;
     this.pendingTpaSender = '';
     this.tpaAcceptedNotified = false;
     this.tpaAttemptNotified = false;
     this.tpaFailureNotified = false;
+    this.pendingCashout = null;
     this.returnResolver = null;
     this.ticketRetryAt = 0;
     this.isEating = false;
@@ -165,6 +168,7 @@ class BotController {
     this.homeRecoveryExpectedRestartUntil = 0;
     this.homeRecoverySuppressStuckAlertUntil = 0;
     this.lastFarmActivityAt = 0;
+    this.lastFarmTarget = null;
     this.homeRecoveryHomeCommandSentAt = 0;
     this.homeRecoveryStuckAfterHomeAlerted = false;
     this.lastHomeRecoveryDiscordAt = new Map();
@@ -212,10 +216,21 @@ class BotController {
       proxy: getProxyLabel(this.proxy),
       income: this.incomeLabel || '-',
       shortIncome: this.shortIncomeLabel || '-',
+      farm: this.farmSnapshot(),
       hunger: food,
       nextReconnectAt: this.nextScheduledReconnectAt || 0,
       online: Boolean(this.bot && !this.disconnectHandled && !this.userPaused && !this.pausedAuto),
       paused: this.userPaused || this.pausedAuto
+    };
+  }
+
+  farmSnapshot() {
+    const position = this.bot && this.bot.entity && this.bot.entity.position
+      ? vectorSnapshot(this.bot.entity.position)
+      : null;
+    return {
+      bot: position,
+      target: this.lastFarmTarget || null
     };
   }
 
@@ -351,7 +366,8 @@ class BotController {
 
     bot.on('messagestr', (...args) => {
       const rawMsg = stripMinecraftFormatting(args[0] || '').trim();
-      this.recordChatLine('IN', rawMsg);
+      const position = args[1] || '';
+      this.recordChatLine('IN', rawMsg, position);
       const myName = this.bot ? this.bot.username : null;
       if (myName && rawMsg.includes(myName)) {
         this.lastChatWithMyName = rawMsg;
@@ -361,8 +377,17 @@ class BotController {
       this.handleMessageString(args[0]);
     });
 
-    bot.on('message', (jsonMsg) => {
+    bot.on('message', (...args) => {
+      const jsonMsg = args[0];
+      const position = args[1] || '';
       const text = collectStrings(jsonMsg, { maxDepth: 10, maxStrings: 80 }).join(' ') || String(jsonMsg || '');
+      const rawMsg = stripMinecraftFormatting(text).trim();
+      this.recordChatLine('IN', rawMsg, position);
+      const myName = this.bot ? this.bot.username : null;
+      if (myName && rawMsg.includes(myName)) {
+        this.lastChatWithMyName = rawMsg;
+        this.lastChatWithMyNameTime = Date.now();
+      }
       this.handleMessageString(text);
     });
 
@@ -789,6 +814,9 @@ class BotController {
     this.foodTimer = null;
     this.playerAlertTimer = null;
     this.homeRecoveryTimer = null;
+    this.pendingCashout = null;
+    this.tpaInProgress = false;
+    this.pendingTpaSender = '';
     if (this.returnResolver) {
       this.returnResolver('disconnect');
       this.returnResolver = null;
@@ -826,6 +854,15 @@ class BotController {
       this.clearReconnectTimer();
       this.reconnectTimer = setTimeout(() => this.connect(), 1000);
     });
+  }
+
+  recoverCommandChannel(reason) {
+    if (!this.bot || this.disconnectHandled || this.userPaused) return false;
+    const detail = String(reason || 'command channel did not respond').slice(0, 240);
+    this.logger.warn(`Recovering command channel by reconnecting bot: ${detail}`);
+    this.manager.dashboard?.sendLog(`♻️ \`${this.displayName()}\` reconnecting to recover stuck command channel. Reason: \`${discordInline(detail, 180)}\``);
+    this.reconnectNow();
+    return true;
   }
 
   async shutdown() {
@@ -1501,6 +1538,10 @@ class BotController {
 
   async cashout() {
     if (!this.bot || this.disconnectHandled) return false;
+    if (this.pendingCashout) {
+      this.logger.warn('Cashout skipped: another cashout is already in progress');
+      return false;
+    }
     const before = await this.refreshBalance();
     if (!before.ok || !Number.isFinite(before.balance) || before.balance <= 0) return false;
     const cashoutNickname = String(this.config.cashout_nickname || '').trim();
@@ -1515,24 +1556,34 @@ class BotController {
     const payment = {
       success: false,
       error: false,
-      message: ''
+      message: '',
+      replies: [],
+      target: cashoutNickname,
+      amount,
+      startedAt: Date.now()
     };
 
     const replyListener = (jsonMsg) => {
       try {
         const text = collectStrings(jsonMsg, { maxDepth: 10 }).join(' ');
         const rawText = stripMinecraftFormatting(text).trim();
-        const classified = classifyCashoutReply(rawText, cashoutNickname);
+        const classified = classifyCashoutReply(rawText, cashoutNickname, amount);
         if (!classified) return;
+        rememberCashoutReply(payment, classified.message || rawText);
         if (classified.type === 'success') payment.success = true;
         if (classified.type === 'error') payment.error = true;
         payment.message = classified.message;
       } catch(e) {}
     };
 
+    const wasFarming = this.attackLoopActive || this.status === 'Farming';
+    this.pendingCashout = payment;
     this.bot.on('message', replyListener);
     this.bot.on('messagestr', replyListener);
     try {
+      this.stopAttack(true);
+      this.setStatus('Cashout');
+      this.closeCurrentWindow('before cashout');
       this.sendChat(`/pay ${cashoutNickname} ${amount}`);
       this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}`);
 
@@ -1542,42 +1593,50 @@ class BotController {
       if (payment.error) {
         const reason = payment.message || 'server rejected payment';
         this.logger.warn(`Cashout rejected: ${reason}`);
-        this.manager.dashboard?.sendLog(`❌ \`${this.displayName()}\` failed to cashout **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`. Reason: \`${reason.slice(0, 180)}\``);
+        this.closeCurrentWindow('after rejected cashout');
+        this.manager.dashboard?.sendLog(`❌ \`${this.displayName()}\` failed to cashout **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`);
         return false;
       }
+
+      const verified = await this.verifyCashoutBalanceDrop(before.balance, amount);
+      if (verified.ok) {
+        this.logger.info(`Cashout confirmed amount=${amount} target=${cashoutNickname} ${verified.reason}`);
+        return true;
+      }
+
+      if (payment.error) {
+        const reason = payment.message || 'server rejected payment';
+        this.logger.warn(`Cashout rejected during verification: ${reason}`);
+        this.closeCurrentWindow('after failed cashout');
+        this.manager.dashboard?.sendLog(`❌ \`${this.displayName()}\` failed to cashout **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`);
+        return false;
+      }
+
+      if (payment.success) {
+        this.logger.info(`Cashout accepted by server amount=${amount} target=${cashoutNickname}${payment.message ? ` reply=${payment.message.slice(0, 160)}` : ''}`);
+        return true;
+      }
+
+      const lastBalance = Number.isFinite(verified.balance) ? `$${formatCompactMoney(verified.balance)}` : 'unknown';
+      const reason = verified.reason || 'no server success reply and source balance did not drop enough';
+      this.logger.warn(`Cashout unconfirmed amount=${amount} target=${cashoutNickname} balanceBefore=${before.balance} balanceAfter=${lastBalance} reason=${reason}`);
+      this.closeCurrentWindow('after unconfirmed cashout');
+      this.manager.dashboard?.sendLog(
+        `⚠️ \`${this.displayName()}\` cashout to \`${cashoutNickname}\` is **not confirmed**. Tried: **$${amount.toLocaleString('en-US')}**. Balance now: \`${lastBalance}\`. Reason: \`${discordInline(reason, 220)}\`${this.cashoutDiagnosticSuffix(payment)}`
+      );
+      if (this.settings.cashout_reconnect_on_unconfirmed !== false) {
+        this.recoverCommandChannel(`cashout unconfirmed; ${reason}`);
+      }
+      return false;
     } finally {
       this.bot?.removeListener('message', replyListener);
       this.bot?.removeListener('messagestr', replyListener);
+      if (this.pendingCashout === payment) this.pendingCashout = null;
+      if (this.status === 'Cashout') this.setStatus('Ready');
+      if (wasFarming && this.bot && !this.disconnectHandled && !this.tpaInProgress) {
+        this.startFarming().catch((error) => this.logger.warn(`Failed to restart farming after cashout: ${error.message || error}`));
+      }
     }
-
-    const verified = await this.verifyCashoutBalanceDrop(before.balance, amount);
-    if (verified.ok) {
-      const msg = [
-        `💸 \`${this.displayName()}\` transferred **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`.`,
-        `Verified: \`${verified.reason}\``,
-        Number.isFinite(verified.balance) ? `Balance now: \`$${formatCompactMoney(verified.balance)}\`` : ''
-      ].filter(Boolean).join(' ');
-      this.manager.dashboard?.sendLog(msg);
-      return true;
-    }
-
-    if (payment.success) {
-      const msg = [
-        `💸 \`${this.displayName()}\` transferred **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`.`,
-        `Verified: \`server reply\``,
-        payment.message ? `Reply: \`${payment.message.slice(0, 160)}\`` : ''
-      ].filter(Boolean).join(' ');
-      this.manager.dashboard?.sendLog(msg);
-      return true;
-    }
-
-    const lastBalance = Number.isFinite(verified.balance) ? `$${formatCompactMoney(verified.balance)}` : 'unknown';
-    const reason = verified.reason || 'no server success reply and source balance did not drop enough';
-    this.logger.warn(`Cashout unconfirmed amount=${amount} target=${cashoutNickname} balanceBefore=${before.balance} balanceAfter=${lastBalance} reason=${reason}`);
-    this.manager.dashboard?.sendLog(
-      `⚠️ \`${this.displayName()}\` cashout to \`${cashoutNickname}\` is **not confirmed**. Tried: **$${amount.toLocaleString('en-US')}**. Balance now: \`${lastBalance}\`. Reason: \`${reason}\``
-    );
-    return false;
   }
 
   async verifyCashoutBalanceDrop(beforeBalance, amount) {
@@ -1612,6 +1671,27 @@ class BotController {
         ? `balance drop only $${formatCompactMoney(Math.max(0, drop))}; required $${formatCompactMoney(requiredDrop)}`
         : `balance verification unavailable${lastCode ? ` (${lastCode})` : ''}`
     };
+  }
+
+  cashoutDiagnosticSuffix(payment) {
+    if (!payment) return '';
+    const lines = [];
+    for (const reply of payment.replies || []) lines.push(reply);
+    const startedAt = Number(payment.startedAt) || Date.now();
+    for (const entry of this.chatLog.slice(-12)) {
+      if (!entry || !entry.text || entry.at < startedAt - 2000) continue;
+      const line = `${entry.direction}: ${entry.text}`;
+      if (!lines.includes(line)) lines.push(line);
+    }
+
+    const shown = lines
+      .map((line) => discordInline(line, 180))
+      .filter(Boolean)
+      .slice(-5);
+
+    const parts = [];
+    if (shown.length) parts.push(`Chat: ${shown.map((line) => `\`${line}\``).join(' | ')}`);
+    return parts.length ? `\n${parts.join('\n')}` : '';
   }
 
   async checkAxe() {
@@ -1908,8 +1988,10 @@ class BotController {
       if (typeof this.bot.swingArm === 'function') this.bot.swingArm('right');
 
       // bot.dig(блок, смотретьЛиНаБлок, типРейкаста) - строго как в minimal_bot.js (forceLook: true)
+      this.recordFarmTarget(target);
       await this.bot.dig(target, true, 'raycast');
       this.markFarmActivity();
+      this.recordFarmTarget(target);
       this.logTargetBlock(target, target);
 
     } catch (err) {
@@ -1994,6 +2076,15 @@ class BotController {
     if (this.homeRecoveryState === HOME_RECOVERY.monitoring && this.bot && this.bot.entity && this.bot.entity.position) {
       this.markHomeRecoveryMovement(now);
     }
+  }
+
+  recordFarmTarget(block, now = Date.now()) {
+    if (!block || !block.position) return;
+    this.lastFarmTarget = {
+      name: String(block.name || 'unknown'),
+      position: vectorSnapshot(block.position),
+      at: now
+    };
   }
 
   swingMainHand() {
@@ -2141,12 +2232,21 @@ class BotController {
     }
   }
 
-  recordChatLine(direction, message) {
+  recordChatLine(direction, message, kind = '') {
     const text = stripMinecraftFormatting(message || '').trim();
     if (!text) return;
+    const directionKey = String(direction || 'IN').toUpperCase();
+    const chatKind = normalizeChatKind(kind);
+    if (directionKey === 'IN' && !shouldShowMinecraftChatLine({ text, kind: chatKind })) return;
+    const dedupeKey = `${directionKey}:${chatKind}:${text}`;
+    const now = Date.now();
+    if (this.lastRecordedChatKey === dedupeKey && now - this.lastRecordedChatAt < 750) return;
+    this.lastRecordedChatKey = dedupeKey;
+    this.lastRecordedChatAt = now;
     const entry = {
-      at: Date.now(),
-      direction: String(direction || 'IN').toUpperCase(),
+      at: now,
+      direction: directionKey,
+      kind: chatKind,
       text: text.slice(0, 500)
     };
     this.chatLog.push(entry);
@@ -2156,13 +2256,12 @@ class BotController {
 
   getChatLog(limit = 30) {
     const count = Math.max(1, Math.min(80, Number(limit) || 30));
-    const fileEntries = readMinecraftChatLog(this.botConfig.username, count, this.logger);
-    if (fileEntries.length) return fileEntries;
-    return this.chatLog.slice(-count);
+    const fileEntries = readMinecraftChatLog(this.botConfig.username, Math.max(count * 12, count), this.logger);
+    if (fileEntries.length) return filterMinecraftChatEntries(fileEntries, count);
+    return filterMinecraftChatEntries(this.chatLog, count);
   }
 
   sendConsoleChat(command) {
-    this.recordChatLine('OUT', command);
     this.sendChat(command);
   }
 
@@ -2173,12 +2272,15 @@ class BotController {
     this.tpaAcceptedNotified = false;
     this.tpaAttemptNotified = false;
     this.tpaFailureNotified = false;
+    let shouldRecoverCommandChannel = false;
     try {
       this.logger.info(`Starting TPA workflow for ${sender}`);
       this.stopAttack(true);
+      this.closeCurrentWindow('before TPA');
       this.setStatus('TPA Trade');
       this.sendChat(this.settings.home_trade_command);
       await sleep(Number(this.settings.teleport_wait_ms) || 1000);
+      this.closeCurrentWindow('before tpaccept');
       this.sendChat(`/tpaccept ${sender}`);
       await sleep(500);
       this.sendChat('/tpaccept');
@@ -2193,11 +2295,18 @@ class BotController {
 
       this.sendChat(this.settings.home_farm_command);
       await sleep(Number(this.settings.teleport_wait_ms) || 1000);
+      shouldRecoverCommandChannel = this.settings.tpa_reconnect_on_no_confirmation !== false &&
+        !this.tpaAcceptedNotified &&
+        !this.tpaFailureNotified;
     } finally {
       this.tpaInProgress = false;
       this.pendingTpaSender = '';
       if (this.status === 'TPA Trade' || this.status === 'Waiting Return') this.setStatus('Ready');
-      this.startFarming();
+      if (shouldRecoverCommandChannel) {
+        this.recoverCommandChannel(`TPA accept for ${sender} had no server confirmation`);
+      } else {
+        this.startFarming();
+      }
     }
   }
 
@@ -2255,9 +2364,23 @@ class BotController {
   sendChat(command) {
     if (!this.bot || !command) return;
     try {
+      this.recordChatLine('OUT', command);
       this.bot.chat(command);
     } catch (error) {
       this.logger.warn(`Failed to send chat command ${command}`, error.message || error);
+    }
+  }
+
+  closeCurrentWindow(reason = 'cleanup') {
+    const window = this.bot && this.bot.currentWindow;
+    if (!window || typeof this.bot.closeWindow !== 'function') return false;
+    try {
+      this.bot.closeWindow(window);
+      this.logger.info(`Closed current window (${reason}): ${describeWindow(window)}`);
+      return true;
+    } catch (error) {
+      this.logger.warn(`Failed to close current window (${reason}): ${error.message || error}`);
+      return false;
     }
   }
 
@@ -2327,6 +2450,19 @@ function normalizeRadians(radians) {
   return value;
 }
 
+function vectorSnapshot(position) {
+  if (!position) return null;
+  const x = Number(position.x);
+  const y = Number(position.y);
+  const z = Number(position.z);
+  if (![x, y, z].every(Number.isFinite)) return null;
+  return {
+    x: Math.round(x * 100) / 100,
+    y: Math.round(y * 100) / 100,
+    z: Math.round(z * 100) / 100
+  };
+}
+
 function formatDuration(durationMs) {
   let seconds = Math.max(0, Math.floor(Number(durationMs) / 1000));
   const hours = Math.floor(seconds / 3600);
@@ -2336,6 +2472,65 @@ function formatDuration(durationMs) {
   if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
   if (minutes > 0) return `${minutes}m ${seconds}s`;
   return `${seconds}s`;
+}
+
+function rememberCashoutReply(payment, message) {
+  if (!payment) return;
+  const text = stripMinecraftFormatting(message || '').trim();
+  if (!text) return;
+  if (!Array.isArray(payment.replies)) payment.replies = [];
+  if (payment.replies[payment.replies.length - 1] !== text) payment.replies.push(text.slice(0, 500));
+  if (payment.replies.length > 12) payment.replies.splice(0, payment.replies.length - 12);
+}
+
+function discordInline(value, maxLength = 180) {
+  const text = stripMinecraftFormatting(value || '')
+    .replace(/`/g, 'ʼ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function normalizeChatKind(kind) {
+  const text = String(kind || '').toLowerCase();
+  if (text === 'game_info' || text === 'actionbar' || text === 'action_bar') return 'game_info';
+  if (text === 'chat' || text === 'system') return text;
+  return text || 'unknown';
+}
+
+function filterMinecraftChatEntries(entries, limit) {
+  const count = Math.max(1, Math.min(80, Number(limit) || 30));
+  return (entries || [])
+    .filter((entry) => shouldShowMinecraftChatLine(entry))
+    .slice(-count);
+}
+
+function shouldShowMinecraftChatLine(entry) {
+  if (!entry || !entry.text) return false;
+  if (String(entry.direction || '').toUpperCase() === 'OUT') return true;
+  const text = stripMinecraftFormatting(entry.text || '').trim();
+  if (!text) return false;
+  const kind = normalizeChatKind(entry.kind || entry.position || entry.type || '');
+  if (kind === 'game_info') return false;
+  if (isMoneyOnlyChatLine(text)) return false;
+  return true;
+}
+
+function isMoneyOnlyChatLine(text) {
+  const value = stripMinecraftFormatting(text || '').trim();
+  return /^\$?\s*[\d,.]+(?:\s*[kmbt])?$/i.test(value);
+}
+
+function describeWindow(window) {
+  if (!window) return 'unknown window';
+  const title = stripMinecraftFormatting([
+    ...collectStrings(window.title, { maxDepth: 6, maxStrings: 40 }),
+    ...collectStrings(window.name, { maxDepth: 6, maxStrings: 40 })
+  ].join(' ')).trim();
+  const type = String(window.type || '').trim();
+  const slotCount = Array.isArray(window.slots) ? window.slots.length : 0;
+  return [type || 'window', title ? `title=${title}` : '', `slots=${slotCount}`].filter(Boolean).join(' ');
 }
 
 function isMicrosoftDeviceCodeExpired(lowerReason) {
@@ -2411,20 +2606,27 @@ function isTpaFailureMessage(lowerMessage) {
   );
 }
 
-function classifyCashoutReply(message, targetNickname) {
+function classifyCashoutReply(message, targetNickname, amount = 0) {
   const text = stripMinecraftFormatting(message || '').trim();
   if (!text || text.startsWith('<')) return null;
   const lower = text.toLowerCase();
   const target = String(targetNickname || '').trim().toLowerCase();
   const mentionsTarget = !target || lower.includes(target);
-  const looksPaymentRelated = /pay|paid|payment|transfer|sent|balance|money|\$|донат|перев|плат|баланс|денег/i.test(text);
-  if (!looksPaymentRelated && !mentionsTarget) return null;
+  const amountText = Number.isFinite(Number(amount)) && Number(amount) > 0 ? String(Math.floor(Number(amount))) : '';
+  const mentionsAmount = amountText ? text.replace(/[,\s]/g, '').includes(amountText) : false;
+  const looksPaymentRelated = /pay|paid|payment|transfer|sent|balance|money|cash|\$|донат|перев|плат|баланс|денег|отправ/i.test(text);
+  if (!looksPaymentRelated && !mentionsTarget && !mentionsAmount) return null;
 
   const errorMarkers = [
     'cannot',
     'error',
     'must',
     'limit',
+    'limited',
+    'maximum',
+    'max',
+    'daily',
+    'wait',
     'insufficient',
     'not enough',
     'too low',
@@ -2436,13 +2638,21 @@ function classifyCashoutReply(message, targetNickname) {
     'usage',
     'cooldown',
     'failed',
+    'expired',
+    'blocked',
+    'disabled',
     'недостаточно',
     'ошибка',
     'нельзя',
     'лимит',
     'не найден',
     'не в сети',
-    'миним'
+    'миним',
+    'подожд',
+    'кулдаун',
+    'истек',
+    'истёк',
+    'отключ'
   ];
   if (errorMarkers.some((marker) => lower.includes(marker))) {
     return { type: 'error', message: text };

@@ -117,6 +117,7 @@ class Manager {
         axe: '-',
         proxy: getProxyLabel(botConfig.effective_proxy || botConfig.proxy || null),
         income: '-',
+        farm: { bot: null, target: null },
         hunger: '-/20',
         nextReconnectAt: 0,
         online: false,
