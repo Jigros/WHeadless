@@ -152,7 +152,7 @@ class Dashboard {
         .setRequired(false))
       .addStringOption((option) => option
         .setName('proxy')
-        .setDescription('host:port, host:port:user:pass, or none')
+        .setDescription('host:port, full proxy shop block, or none')
         .setRequired(false))
       .addStringOption((option) => option
         .setName('proxy_auth')
@@ -356,9 +356,10 @@ class Dashboard {
       const proxy = bot.proxy && bot.proxy.host ? `${bot.proxy.host}:${bot.proxy.port || 1080}` : '';
       const input = new TextInputBuilder()
         .setCustomId('value')
-        .setLabel('Proxy host:port / none')
-        .setStyle(TextInputStyle.Short)
+        .setLabel('Proxy block / host:port / none')
+        .setStyle(TextInputStyle.Paragraph)
         .setRequired(false)
+        .setPlaceholder('socks5 83031\nЛогин: user\nПароль: pass\nВаши IPs:\n1.2.3.4')
         .setValue(proxy);
       modal.addComponents(new ActionRowBuilder().addComponents(input));
       return modal;
@@ -937,24 +938,8 @@ class Dashboard {
 
     const data = {};
     const proxyHost = interaction.fields.getTextInputValue('proxy_host').trim();
-    if (proxyHost.toLowerCase() === 'none') {
-      data.proxy_action = 'remove';
-    } else if (proxyHost) {
-      const parts = proxyHost.split(':');
-      if (parts.length >= 2) {
-        data.proxy_host = parts[0];
-        data.proxy_port = parts[1];
-      }
-    }
-
     const proxyAuth = interaction.fields.getTextInputValue('proxy_auth').trim();
-    if (proxyAuth) {
-      const parts = proxyAuth.split(':');
-      if (parts.length >= 2) {
-        data.proxy_user = parts[0];
-        data.proxy_pass = parts[1];
-      }
-    }
+    this.applyProxyInput(data, proxyHost, proxyAuth);
 
     const action = interaction.fields.getTextInputValue('action').trim().toUpperCase();
 
@@ -1287,25 +1272,12 @@ class Dashboard {
         return;
       }
 
-      const withoutScheme = proxy.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
-      const parts = withoutScheme.split(':');
-      if (parts.length < 2) {
-        throw new Error('Proxy must be `host:port`, `host:port:user:pass`, or `none`.');
-      }
-
-      const host = parts.shift().trim();
-      const port = Number(parts.shift());
-      if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
-        throw new Error('Proxy host/port is invalid. Use `host:port`.');
-      }
-
-      data.proxy_host = host;
-      data.proxy_port = String(port);
-
-      if (parts.length) {
-        data.proxy_user = parts.shift();
-        data.proxy_pass = parts.join(':');
-      }
+      const parsed = this.parseProxyInput(proxy);
+      data.proxy_type = parsed.type;
+      data.proxy_host = parsed.host;
+      data.proxy_port = String(parsed.port);
+      if (parsed.username) data.proxy_user = parsed.username;
+      if (parsed.password) data.proxy_pass = parsed.password;
     }
 
     if (proxyAuth && proxyAuth.toLowerCase() !== 'none') {
@@ -1316,6 +1288,128 @@ class Dashboard {
       data.proxy_user = authParts.shift();
       data.proxy_pass = authParts.join(':');
     }
+  }
+
+  parseProxyInput(proxyInput) {
+    const text = String(proxyInput || '').trim();
+    const block = this.parseProxyShopBlock(text);
+    if (block) return block;
+
+    const url = this.parseProxyUrl(text);
+    if (url) return url;
+
+    const inline = this.parseInlineProxy(text);
+    if (inline) return inline;
+
+    throw new Error('Proxy must be `host:port`, `host:port:user:pass`, full shop block, or `none`.');
+  }
+
+  parseProxyShopBlock(text) {
+    const lines = String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length < 2) return null;
+
+    let type = '';
+    let port = 0;
+    for (const line of lines) {
+      const match = line.match(/\b(socks5|socks4|https?|http)\b\D{0,12}(\d{2,5})\b/i);
+      if (!match) continue;
+      type = this.normalizeProxyType(match[1]);
+      port = Number(match[2]);
+      break;
+    }
+
+    if (type && !this.validProxyPort(port)) {
+      throw new Error(`Proxy port ${port} is invalid. TCP port must be 1-65535.`);
+    }
+    if (!type) return null;
+
+    const username = this.extractLabeledProxyValue(text, ['логин', 'login', 'username', 'user']);
+    const password = this.extractLabeledProxyValue(text, ['пароль', 'password', 'pass']);
+    const host = this.extractProxyHostFromBlock(text);
+    if (!host) return null;
+
+    return { type, host, port, username, password };
+  }
+
+  parseProxyUrl(text) {
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) return null;
+    try {
+      const url = new URL(text);
+      const type = this.normalizeProxyType(url.protocol.replace(':', ''));
+      const host = url.hostname;
+      const port = Number(url.port);
+      if (!this.validProxyType(type) || !host) return null;
+      if (!this.validProxyPort(port)) {
+        throw new Error(`Proxy port ${url.port || '?'} is invalid. TCP port must be 1-65535.`);
+      }
+      return {
+        type,
+        host,
+        port,
+        username: decodeURIComponent(url.username || ''),
+        password: decodeURIComponent(url.password || '')
+      };
+    } catch (error) {
+      if (error && String(error.message || '').includes('TCP port')) throw error;
+      return null;
+    }
+  }
+
+  parseInlineProxy(text) {
+    const normalized = String(text || '').trim();
+    const prefixed = normalized.match(/^(socks5|socks4|https?|http)\s+(.+)$/i);
+    const type = this.normalizeProxyType(prefixed ? prefixed[1] : 'socks5');
+    const body = prefixed ? prefixed[2].trim() : normalized.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+    const parts = body.split(':');
+    if (parts.length < 2) return null;
+
+    const host = parts.shift().trim();
+    const port = Number(parts.shift());
+    if (!host) return null;
+    if (!this.validProxyPort(port)) {
+      throw new Error(`Proxy port ${Number.isFinite(port) ? port : '?'} is invalid. TCP port must be 1-65535.`);
+    }
+
+    const parsed = { type, host, port, username: '', password: '' };
+    if (parts.length) {
+      parsed.username = parts.shift();
+      parsed.password = parts.join(':');
+    }
+    return parsed;
+  }
+
+  extractLabeledProxyValue(text, labels) {
+    const escaped = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    const pattern = new RegExp(`(?:^|\\n)\\s*(?:${escaped})\\s*[:=\\-]\\s*(.+)`, 'i');
+    const match = String(text || '').match(pattern);
+    return match ? match[1].trim().split(/\s+/)[0] : '';
+  }
+
+  extractProxyHostFromBlock(text) {
+    const afterIpLabel = String(text || '').match(/(?:ваши\s+ips?|ips?|ip|host|сервер)\s*:?\s*([\s\S]+)/i);
+    const haystack = afterIpLabel ? afterIpLabel[1] : String(text || '');
+    const ipv4 = haystack.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+    if (ipv4 && this.validIPv4(ipv4[0])) return ipv4[0];
+
+    const labeled = String(text || '').match(/(?:host|server|сервер)\s*[:=\-]\s*([a-z0-9.-]+\.[a-z0-9.-]+)/i);
+    return labeled ? labeled[1].trim() : '';
+  }
+
+  normalizeProxyType(type) {
+    return String(type || 'socks5').toLowerCase().replace(/:$/, '');
+  }
+
+  validProxyType(type) {
+    return ['socks5', 'socks4', 'http', 'https'].includes(this.normalizeProxyType(type));
+  }
+
+  validProxyPort(port) {
+    return Number.isInteger(port) && port >= 1 && port <= 65535;
+  }
+
+  validIPv4(value) {
+    const parts = String(value || '').split('.').map((part) => Number(part));
+    return parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255);
   }
 
   async fetchDashboardChannel() {

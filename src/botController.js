@@ -295,14 +295,13 @@ class BotController {
     const proxyAgent = createHttpAgent(this.proxy);
     if (proxyAgent) {
       options.agent = proxyAgent;
-    } else {
-      const proxyConnect = createMineflayerConnect(this.proxy, server.host, server.port, this.logger);
-      if (proxyConnect) options.connect = proxyConnect;
     }
+    const proxyConnect = createMineflayerConnect(this.proxy, server.host, server.port, this.logger);
+    if (proxyConnect) options.connect = proxyConnect;
 
     try {
       this.logger.info(
-        `Connecting as ${this.botConfig.username} to ${server.host}:${server.port} version=${options.version} proxy=${getProxyLabel(this.proxy)}`
+        `Connecting as ${this.botConfig.username} to ${server.host}:${server.port} version=${options.version} proxy=${getProxyLabel(this.proxy)} mcConnect=${proxyConnect ? 'proxy' : 'direct'}`
       );
       this.bot = mineflayer.createBot(options);
       this.attachBotEvents(this.bot);

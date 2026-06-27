@@ -318,6 +318,7 @@ class Manager {
       delete botConfig.effective_proxy;
     } else if (data.proxy_host) {
       botConfig.proxy = botConfig.proxy || { type: 'socks5' };
+      botConfig.proxy.type = data.proxy_type || botConfig.proxy.type || 'socks5';
       botConfig.proxy.host = data.proxy_host;
       botConfig.proxy.port = parseInt(data.proxy_port, 10);
       if (data.proxy_user) {
