@@ -132,12 +132,14 @@ class BotController {
     this.attackLoopActive = false;
     this.balanceTimer = null;
     this.axeTimer = null;
+    this.axeRecoveryTimer = null;
     this.foodTimer = null;
     this.playerAlertTimer = null;
     this.homeRecoveryTimer = null;
     this.scheduledReconnectTimer = null;
     this.nextScheduledReconnectAt = 0;
     this.noAxeTickCount = 0;
+    this.resumeFarmingAfterAxe = false;
     this.lastBrokenFarmPosKey = null;
     this.attackTargetCycleIndex = 0;
     this.lastTargetLogAt = 0;
@@ -426,9 +428,13 @@ class BotController {
     bot.on('playerCollect', (collector, collected) => {
       if (this.bot && this.bot.entity && collector.id === this.bot.entity.id) {
         if (this.status === 'Waiting Axe') {
-          setTimeout(() => this.startFarming().catch(e => this.logger.warn(e)), 500);
+          setTimeout(() => this.tryRecoverAxeAndFarming().catch(e => this.logger.warn(e)), 500);
         }
       }
+    });
+
+    bot.on('heldItemChanged', () => {
+      this.handleHeldItemChanged();
     });
 
     bot.on('health', () => {
@@ -591,6 +597,14 @@ class BotController {
       return;
     }
 
+    if (kind === 'kicked' && classification.category === 'Server Security') {
+      this.clearReconnectTimer();
+      this.pausedAuto = true;
+      this.setStatus('Server Security / Discord Verify');
+      this.logger.warn('Server security kick detected; auto-reconnect paused until Discord verification is confirmed');
+      return;
+    }
+
     if (kind === 'kicked' && (lowerReason.includes('make a ticket') || lowerReason.includes("don't know what happened"))) {
       this.ticketRetryAt = Date.now() + (12 * 60 * 1000);
       this.clearReconnectTimer();
@@ -662,6 +676,9 @@ class BotController {
     }
     if (lower.includes('failed to obtain profile data') && lower.includes('does the account own minecraft')) {
       return { category: 'Minecraft Profile', message: 'Microsoft account authenticated, but Minecraft Java profile was not found. Check that this account owns Minecraft Java Edition.' };
+    }
+    if (isServerSecurityKick(kind, lower)) {
+      return { category: 'Server Security', message: 'DonutSMP blocked this login as a possible unauthorized login. Confirm it with the button in this account Discord DMs, then turn the bot ON again.' };
     }
     if (lower.includes('already online')) {
       return { category: 'Session', message: 'This Minecraft account is already online. Possible ghost session.' };
@@ -811,6 +828,7 @@ class BotController {
     if (this.cameraTimer) clearInterval(this.cameraTimer);
     if (this.balanceTimer) clearInterval(this.balanceTimer);
     if (this.axeTimer) clearInterval(this.axeTimer);
+    this.clearAxeRecoveryTimer();
     if (this.foodTimer) clearInterval(this.foodTimer);
     if (this.playerAlertTimer) clearInterval(this.playerAlertTimer);
     if (this.homeRecoveryTimer) clearInterval(this.homeRecoveryTimer);
@@ -822,6 +840,7 @@ class BotController {
     this.playerAlertTimer = null;
     this.homeRecoveryTimer = null;
     this.pendingCashout = null;
+    this.resumeFarmingAfterAxe = false;
     this.tpaInProgress = false;
     this.pendingTpaSender = '';
     if (this.returnResolver) {
@@ -934,6 +953,42 @@ class BotController {
     this.axeTimer = setInterval(() => {
       this.checkAxe().catch((error) => this.logger.warn('Axe check failed', error));
     }, Number(this.settings.axe_scan_interval_ms) || 60000);
+  }
+
+  clearAxeRecoveryTimer() {
+    if (this.axeRecoveryTimer) clearTimeout(this.axeRecoveryTimer);
+    this.axeRecoveryTimer = null;
+  }
+
+  scheduleAxeRecoveryCheck() {
+    if (this.axeRecoveryTimer || !this.bot || this.disconnectHandled) return;
+    const retryMs = Math.max(1000, Number(this.settings.axe_wait_retry_ms) || 5000);
+    this.axeRecoveryTimer = setTimeout(() => {
+      this.axeRecoveryTimer = null;
+      this.tryRecoverAxeAndFarming().catch((error) => {
+        this.logger.warn(`Axe recovery check failed: ${error.message || error}`);
+        this.scheduleAxeRecoveryCheck();
+      });
+    }, retryMs);
+  }
+
+  async tryRecoverAxeAndFarming() {
+    if (!this.bot || this.disconnectHandled || this.userPaused || this.pausedAuto) return false;
+    const ok = await this.checkAxe();
+    if (!ok) return false;
+    if (!this.resumeFarmingAfterAxe || !this.canResumeFarmingAfterAxe()) return true;
+
+    this.resumeFarmingAfterAxe = false;
+    await this.lockFarmCamera().catch((error) => this.logger.warn(`Axe recovery camera lock failed: ${error.message || error}`));
+    return this.startFarming();
+  }
+
+  canResumeFarmingAfterAxe() {
+    if (this.settings.farming_enabled === false) return false;
+    if (!this.bot || this.disconnectHandled || this.userPaused || this.pausedAuto) return false;
+    if (this.tpaInProgress || this.isEating) return false;
+    if (this.status === 'TPA Trade' || this.status === 'Waiting Return' || this.status === 'Dead / Respawning') return false;
+    return this.homeRecoveryState === HOME_RECOVERY.monitoring;
   }
 
   startFoodPolling() {
@@ -1752,8 +1807,26 @@ class BotController {
     }
 
     this.axeAlerted = false;
+    this.clearAxeRecoveryTimer();
     if (this.status === 'Waiting Axe') this.setStatus('Ready');
     return true;
+  }
+
+  handleHeldItemChanged() {
+    if (!this.attackLoopActive || !this.bot || this.disconnectHandled || this.isEating) return;
+    const held = this.bot.heldItem;
+    if (this.matchesAxe(held)) {
+      const result = this.inspectAxe(held);
+      if (result.ok) return;
+      this.stopDiggingIfNeeded(result.reason || 'axe expired');
+    } else {
+      this.stopDiggingIfNeeded('held item is not axe');
+    }
+
+    this.checkAxe().catch((error) => {
+      this.logger.warn(`Held item axe recovery failed: ${error.message || error}`);
+      this.handleAxeUnavailable('axe check failed');
+    });
   }
 
   async autoEat(source = 'manual') {
@@ -1898,10 +1971,15 @@ class BotController {
   async ensureAxeEquipped() {
     if (!this.bot) return { ok: false, reason: 'offline' };
     const held = this.bot.heldItem;
-    if (this.matchesAxe(held)) return this.inspectAxe(held);
+    let heldFailure = '';
+    if (this.matchesAxe(held)) {
+      const heldResult = this.inspectAxe(held);
+      if (heldResult.ok) return heldResult;
+      heldFailure = heldResult.reason || 'axe unavailable';
+    }
 
-    const item = this.findAxeItem();
-    if (!item) return { ok: false, reason: 'axe missing' };
+    const item = this.findUsableAxeItem();
+    if (!item) return { ok: false, reason: heldFailure || 'axe missing' };
 
     try {
       await this.bot.equip(item, 'hand');
@@ -1925,9 +2003,12 @@ class BotController {
   }
 
   handleAxeUnavailable(reason) {
+    const shouldResume = this.resumeFarmingAfterAxe || this.attackLoopActive || this.status === 'Farming' || this.status === 'Waiting Axe';
+    this.resumeFarmingAfterAxe = shouldResume;
     this.axeLabel = reason || 'Missing';
     this.stopAttack(true);
     this.setStatus('Waiting Axe');
+    this.scheduleAxeRecoveryCheck();
     if (!this.axeAlerted) {
       this.axeAlerted = true;
       this.manager.alertCritical(this, `Axe unavailable: ${reason || 'missing'} пинг @everyone`);
@@ -1955,6 +2036,17 @@ class BotController {
     return this.bot.inventory.items().find((item) => this.matchesAxe(item)) || null;
   }
 
+  findUsableAxeItem() {
+    if (!this.bot || !this.bot.inventory) return null;
+    for (const item of this.bot.inventory.items()) {
+      if (!this.matchesAxe(item)) continue;
+      const timer = parseSelfDestructTimerFromItem(item);
+      if (timer.expired) continue;
+      return item;
+    }
+    return null;
+  }
+
   currentAxeSignature() {
     const item = (this.bot && this.bot.heldItem && this.matchesAxe(this.bot.heldItem))
       ? this.bot.heldItem
@@ -1968,6 +2060,7 @@ class BotController {
     const ok = await this.checkAxe();
     if (!ok) return false;
 
+    this.resumeFarmingAfterAxe = false;
     this.patchDigTime();
     this.setStatus('Farming');
     this.attackLoopActive = true;
@@ -2006,6 +2099,9 @@ class BotController {
 
   async attackTick() {
     if (!this.bot || !this.bot.entity || this.disconnectHandled) return;
+
+    const axeReady = await this.checkAxe();
+    if (!axeReady || !this.attackLoopActive || !this.bot || this.disconnectHandled) return;
 
     const reach = Math.max(1, Number(this.settings.farm_reach_blocks) || 4.5);
     const target = this.selectAttackTarget(reach);
@@ -2595,6 +2691,14 @@ function isMicrosoftDeviceCodeExpired(lowerReason) {
     text.includes('device code') ||
     text.includes('code has expired')
   );
+}
+
+function isServerSecurityKick(kind, lowerReason) {
+  if (kind !== 'kicked') return false;
+  const text = String(lowerReason || '').toLowerCase();
+  return text.includes('possible unauthorized login') ||
+    text.includes('confirm it via the button in your discord dms') ||
+    (text.includes('for your own safety') && text.includes('blocked it'));
 }
 
 function parseTpaSender(message) {

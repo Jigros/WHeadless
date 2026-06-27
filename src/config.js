@@ -56,6 +56,7 @@ const DEFAULT_CONFIG = {
     proxy_microsoft_auth: false,
     attack_interval_ms: 150,
     axe_scan_interval_ms: 60000,
+    axe_wait_retry_ms: 5000,
     balance_interval_ms: 300000,
     profit_window_ms: 300000,
     profit_warmup_ms: 300000,
