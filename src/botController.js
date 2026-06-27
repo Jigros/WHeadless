@@ -133,6 +133,7 @@ class BotController {
     this.announceNextLogin = Boolean(botConfig.announce_login_on_next_start);
     this.reconnectTimer = null;
     this.lastConnectionClosedAt = 0;
+    this.spawnSessionInitialized = false;
     this.attackTimer = null;
     this.attackLoopActive = false;
     this.balanceTimer = null;
@@ -142,6 +143,7 @@ class BotController {
     this.playerAlertTimer = null;
     this.farmRefreshTimer = null;
     this.farmRefreshInProgress = false;
+    this.lastFarmRefreshAt = 0;
     this.homeRecoveryTimer = null;
     this.scheduledReconnectTimer = null;
     this.nextScheduledReconnectAt = 0;
@@ -330,6 +332,7 @@ class BotController {
     this.clearReconnectTimer();
     this.disconnectHandled = false;
     this.manualClose = false;
+    this.spawnSessionInitialized = false;
     this.phase = 'creating';
     this.setStatus('Connecting');
 
@@ -526,6 +529,13 @@ class BotController {
 
   async onSpawn(bot) {
     if (bot !== this.bot) return;
+    const isDeathRespawn = this.status === 'Dead / Respawning';
+    if (this.spawnSessionInitialized && !isDeathRespawn) {
+      this.markHomeRecoveryMovement();
+      this.logThrottled('extra-spawn-event', `Ignoring extra spawn event while status=${this.status}`, 30000);
+      return;
+    }
+    this.spawnSessionInitialized = true;
     this.disconnectHandled = false;
     this.phase = 'play';
     this.setStatus('Spawned');
@@ -753,6 +763,9 @@ class BotController {
     if (classification.category === 'Minecraft Profile') {
       lines.push('note=Microsoft auth succeeded, but Mojang/Minecraft profile lookup failed. If the next login works, treat this as transient auth/profile-service failure.');
     }
+    if (classification.category === 'Minecraft Session') {
+      lines.push('note=Mojang session join failed before server login. If the next login works, treat this as transient Mojang/session/proxy failure.');
+    }
     return `\nDiagnostics: \`${discordInline(lines.join(' | '), 900)}\``;
   }
 
@@ -770,6 +783,9 @@ class BotController {
     }
     if (lower.includes('econnreset')) {
       return { category: 'Network', message: 'Network connection was reset while contacting Minecraft/Mojang services.' };
+    }
+    if (lower.includes('sessionserver.mojang.com') || lower.includes('/session/minecraft/join') || lower.includes('minecraft/join')) {
+      return { category: 'Minecraft Session', message: 'Mojang session join request failed before server login. This is usually transient network/proxy/sessionserver failure.' };
     }
     if (lower.includes('proxy') || lower.includes('socks') || lower.includes('connect timed out') || lower.includes('econnrefused') || lower.includes('enotfound') || lower.includes('ehostunreach')) {
       return { category: 'Proxy', message: 'Proxy connection failed or timed out.' };
@@ -842,6 +858,7 @@ class BotController {
   forceClose() {
     const bot = this.bot;
     this.lastConnectionClosedAt = Date.now();
+    this.spawnSessionInitialized = false;
     this.bot = null;
     if (!bot) return;
     try {
@@ -967,6 +984,18 @@ class BotController {
   }
 
   async runFarmRefresh() {
+    const interval = Math.max(60 * 1000, Number(this.settings.farm_refresh_interval_ms) || 60 * 60 * 1000);
+    const minInterval = Math.max(
+      60 * 1000,
+      Number(this.settings.farm_refresh_min_interval_ms) || Math.min(interval, 55 * 60 * 1000)
+    );
+    if (this.lastFarmRefreshAt && Date.now() - this.lastFarmRefreshAt < minInterval) {
+      const retryMs = Math.max(1000, this.lastFarmRefreshAt + minInterval - Date.now());
+      this.logger.info(`Farm refresh skipped: last refresh was ${formatDuration(Date.now() - this.lastFarmRefreshAt)} ago; retry in ${formatDuration(retryMs)}`);
+      this.scheduleFarmRefresh(retryMs);
+      return false;
+    }
+
     const busyReason = this.farmRefreshBusyReason();
     if (busyReason) {
       const retryMs = Math.max(60 * 1000, Number(this.settings.scheduled_reconnect_busy_retry_ms) || 5 * 60 * 1000);
@@ -984,10 +1013,12 @@ class BotController {
     }
 
     this.farmRefreshInProgress = true;
+    this.lastFarmRefreshAt = Date.now();
     const wasFarming = this.attackLoopActive || this.status === 'Farming';
     try {
+      const home2Seconds = Math.round(Math.max(1000, Number(this.settings.farm_refresh_home2_wait_ms) || 6000) / 1000);
       this.logger.info(`Farm refresh: ${home2} -> wait -> ${home1}`);
-      this.manager.dashboard?.sendLog(`♻️ \`${this.displayName()}\` refreshing farm timing: \`${home2}\` for 6s, then \`${home1}\`.`);
+      this.manager.dashboard?.sendLog(`♻️ \`${this.displayName()}\` refreshing farm timing: \`${home2}\` for ${home2Seconds}s, then \`${home1}\`.`);
       this.stopAttack(true);
       this.closeCurrentWindow('before farm refresh');
       this.setStatus('Farm Refresh / Home 2');
@@ -1031,6 +1062,7 @@ class BotController {
     this.playerAlertTimer = null;
     this.farmRefreshTimer = null;
     this.farmRefreshInProgress = false;
+    this.spawnSessionInitialized = false;
     this.homeRecoveryTimer = null;
     this.pendingCashout = null;
     this.pendingGameBalances.clear();
@@ -1380,9 +1412,11 @@ class BotController {
 
   shouldPauseHomeRecoveryMovementCheck() {
     if (this.userPaused || this.pausedAuto || this.tpaInProgress || this.isEating || this.pendingCashout) return true;
+    if (this.farmRefreshInProgress) return true;
     if (this.status === 'TPA Trade' || this.status === 'Waiting Return') return true;
     if (this.status === 'Dead / Respawning') return true;
     if (this.status === 'Waiting Axe') return true;
+    if (String(this.status || '').startsWith('Farm Refresh')) return true;
     return false;
   }
 

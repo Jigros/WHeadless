@@ -84,6 +84,7 @@
     "disconnect_home_wait_ms": 6500,
     "farm_refresh_enabled": true,
     "farm_refresh_interval_ms": 3600000,
+    "farm_refresh_min_interval_ms": 3300000,
     "farm_refresh_home2_wait_ms": 6000,
     "farm_refresh_home1_wait_ms": 6500,
     "packet_trace_limit": 120,
