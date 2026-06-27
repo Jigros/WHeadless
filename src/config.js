@@ -107,6 +107,7 @@ const DEFAULT_CONFIG = {
     home_recovery_retry_random_step_minutes: 3,
     home_recovery_retry_max_minutes: 30,
     home_recovery_command_wait_seconds: 8,
+    home_recovery_critical_after_attempts: 3,
     cursor_fallback_enabled: true,
     cursor_fallback_yaw_degrees: [0, 2, -2, 4, -4, 8, -8, 12, -12],
     cursor_fallback_pitch_degrees: [0, 2, -2, 4, -4, 8, -8, 12, -12, 18, -18, 24, -24],

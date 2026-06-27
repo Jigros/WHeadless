@@ -97,6 +97,7 @@
     "home_recovery_retry_random_step_minutes": 3,
     "home_recovery_retry_max_minutes": 30,
     "home_recovery_command_wait_seconds": 8,
+    "home_recovery_critical_after_attempts": 3,
     "cursor_fallback_enabled": true,
     "cursor_fallback_yaw_degrees": [
       0,

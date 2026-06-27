@@ -17,7 +17,7 @@ const {
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder
 } = require('discord.js');
-const { formatCompactMoney, readJsonFile, writeJsonFile } = require('./utils');
+const { formatCompactMoney, normalizeMinecraftText, readJsonFile, writeJsonFile } = require('./utils');
 
 const BUTTONS = {
   refresh: 'dashboard:refresh',
@@ -396,7 +396,7 @@ class Dashboard {
   chatLineText(line) {
     const ts = line && line.at ? `<t:${Math.floor(line.at / 1000)}:T>` : '`--:--`';
     const direction = line && line.direction === 'OUT' ? 'OUT' : 'IN';
-    const text = String((line && line.text) || '').replace(/`/g, 'ʼ');
+    const text = normalizeMinecraftText((line && line.text) || '').replace(/`/g, 'ʼ');
     return `${ts} \`${direction}\` ${this.discordChoiceText(text, 260)}`;
   }
 
@@ -570,7 +570,8 @@ class Dashboard {
         for (const line of text.split(/\r?\n/).filter(Boolean)) {
           try {
             const entry = JSON.parse(line);
-            if (entry && entry.text) entries.push(entry);
+            const normalized = this.normalizeMinecraftChatEntry(entry);
+            if (normalized) entries.push(normalized);
           } catch (error) {}
         }
       }
@@ -583,24 +584,56 @@ class Dashboard {
 
   filterMinecraftChatEntries(entries, limit = 25) {
     const count = Math.max(1, Math.min(80, Number(limit) || 25));
-    return (entries || [])
-      .filter((entry) => this.shouldShowMinecraftChatLine(entry))
-      .slice(-count);
+    const out = [];
+    let lastKey = '';
+    for (const entry of entries || []) {
+      const normalized = this.normalizeMinecraftChatEntry(entry);
+      if (!normalized || !this.shouldShowMinecraftChatLine(normalized)) continue;
+      const key = `${normalized.direction}:${normalized.kind}:${normalized.text}`;
+      if (key === lastKey) continue;
+      lastKey = key;
+      out.push(normalized);
+    }
+    return out.slice(-count);
+  }
+
+  normalizeMinecraftChatEntry(entry) {
+    if (!entry || !entry.text) return null;
+    const text = normalizeMinecraftText(entry.text).trim();
+    if (!text) return null;
+    return {
+      ...entry,
+      direction: String(entry.direction || 'IN').toUpperCase(),
+      kind: this.normalizeMinecraftChatKind(entry.kind || entry.position || entry.type || ''),
+      text: text.slice(0, 500)
+    };
+  }
+
+  normalizeMinecraftChatKind(kind) {
+    const text = String(kind || '').toLowerCase();
+    if (text === 'game_info' || text === 'actionbar' || text === 'action_bar') return 'game_info';
+    if (text === 'chat' || text === 'system') return text;
+    return text || 'unknown';
   }
 
   shouldShowMinecraftChatLine(entry) {
     if (!entry || !entry.text) return false;
     if (String(entry.direction || '').toUpperCase() === 'OUT') return true;
-    const text = String(entry.text || '').replace(/\u00a7[0-9A-FK-OR]/gi, '').trim();
+    const text = normalizeMinecraftText(entry.text).trim();
     if (!text) return false;
-    const kind = String(entry.kind || entry.position || entry.type || '').toLowerCase();
-    if (kind === 'game_info' || kind === 'actionbar' || kind === 'action_bar') return false;
+    const kind = this.normalizeMinecraftChatKind(entry.kind || entry.position || entry.type || '');
+    if (kind === 'game_info') return false;
     return !this.isMoneyNoiseChatLine(text);
   }
 
   isMoneyNoiseChatLine(text) {
-    const value = String(text || '').replace(/\u00a7[0-9A-FK-OR]/gi, '').replace(/\s+/g, ' ').trim();
-    if (/^\$?\s*[\d,.]+(?:\s*[kmbt])?$/i.test(value)) return true;
+    const value = normalizeMinecraftText(text).replace(/\s+/g, ' ').trim();
+    const tokens = value.split(/\s+/).filter(Boolean);
+    if (tokens.length > 0 &&
+      tokens.every((token) => token === '$' || /^\$?[\d,.]+(?:[kmbt])?$/i.test(token)) &&
+      tokens.some((token) => /^[\d,.]+(?:[kmbt])?$/i.test(token.replace(/^\$/, '')))) {
+      return true;
+    }
     if (!value.includes('$')) return false;
     if (!/(#[0-9a-f]{6}|\bwhite\b|\bgray\b|\bgreen\b|\byellow\b|\bgold\b)/i.test(value)) return false;
 
@@ -612,8 +645,8 @@ class Dashboard {
       .trim();
     if (!cleaned) return false;
 
-    const tokens = cleaned.split(/\s+/).filter(Boolean);
-    return tokens.length > 0 && tokens.every((token) => token === '$' || /^[\d,.]+(?:[kmbt])?$/i.test(token));
+    const cleanedTokens = cleaned.split(/\s+/).filter(Boolean);
+    return cleanedTokens.length > 0 && cleanedTokens.every((token) => token === '$' || /^[\d,.]+(?:[kmbt])?$/i.test(token));
   }
 
   safeLogName(value) {

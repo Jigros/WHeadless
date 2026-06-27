@@ -7,6 +7,7 @@ const { createHttpAgent, createMineflayerConnect, getProxyLabel } = require('./p
 const {
   collectStrings,
   formatCompactMoney,
+  normalizeMinecraftText,
   normalizeText,
   parseKickReason,
   parseSelfDestructTimerFromItem,
@@ -173,6 +174,8 @@ class BotController {
     this.lastFarmActivityAt = 0;
     this.lastFarmTarget = null;
     this.homeRecoveryHomeCommandSentAt = 0;
+    this.homeRecoveryFirstCommandAt = 0;
+    this.homeRecoveryAttemptCount = 0;
     this.homeRecoveryStuckAfterHomeAlerted = false;
     this.lastHomeRecoveryDiscordAt = new Map();
     
@@ -196,11 +199,54 @@ class BotController {
   }
 
   displayName() {
-    return (this.bot && this.bot.username) || this.botConfig.nickname || this.botConfig.username;
+    const liveName = cleanProfileName(this.realUsername || (this.bot && this.bot.username));
+    if (liveName) return liveName;
+    return this.botConfig.nickname || this.botConfig.stats_username || this.botConfig.username;
   }
 
   statsUsername() {
-    return (this.bot && this.bot.username) || this.botConfig.stats_username || this.botConfig.username;
+    const liveName = cleanProfileName(this.realUsername || (this.bot && this.bot.username));
+    return liveName || this.botConfig.stats_username || this.botConfig.nickname || this.botConfig.username;
+  }
+
+  rememberProfileName(name, source = 'profile') {
+    const profileName = cleanProfileName(name);
+    if (!profileName) return false;
+
+    this.realUsername = profileName;
+    let changed = false;
+    if (this.botConfig.nickname !== profileName) {
+      this.botConfig.nickname = profileName;
+      changed = true;
+    }
+    if (this.botConfig.stats_username !== profileName) {
+      this.botConfig.stats_username = profileName;
+      changed = true;
+    }
+
+    const configBot = (this.config.bots || []).find((item) => item.username === this.botConfig.username);
+    if (configBot) {
+      if (configBot.nickname !== profileName) {
+        configBot.nickname = profileName;
+        changed = true;
+      }
+      if (configBot.stats_username !== profileName) {
+        configBot.stats_username = profileName;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      try {
+        const { writeJsonFile } = require('./utils');
+        writeJsonFile('config.json', this.config);
+        this.logger.info(`Auto-saved in-game username from ${source}: ${this.botConfig.username} -> ${profileName}`);
+      } catch (error) {
+        this.logger.warn(`Failed to save in-game username from ${source}: ${error.message || error}`);
+      }
+    }
+
+    return true;
   }
 
   setStatus(status) {
@@ -319,8 +365,15 @@ class BotController {
   }
 
   attachBotEvents(bot) {
+    if (bot._client && typeof bot._client.on === 'function') {
+      bot._client.on('session', (session) => {
+        const profileName = session && session.selectedProfile && session.selectedProfile.name;
+        this.rememberProfileName(profileName || bot._client.username, 'session');
+      });
+    }
+
     bot.once('login', () => {
-      this.realUsername = bot.username || this.realUsername;
+      this.rememberProfileName(bot.username, 'login');
       this.lastMsaUserCode = '';
       this.lastMsaCodeAt = 0;
       this.phase = 'play';
@@ -371,7 +424,7 @@ class BotController {
     });
 
     bot.on('messagestr', (...args) => {
-      const rawMsg = stripMinecraftFormatting(args[0] || '').trim();
+      const rawMsg = normalizeMinecraftText(args[0]).trim();
       const position = args[1] || '';
       this.recordChatLine('IN', rawMsg, position);
       const myName = this.bot ? this.bot.username : null;
@@ -380,21 +433,20 @@ class BotController {
         this.lastChatWithMyNameTime = Date.now();
       }
       this.handleHomeRecoveryMessage(rawMsg);
-      this.handleMessageString(args[0]);
+      this.handleMessageString(rawMsg);
     });
 
     bot.on('message', (...args) => {
       const jsonMsg = args[0];
       const position = args[1] || '';
-      const text = collectStrings(jsonMsg, { maxDepth: 10, maxStrings: 80 }).join(' ') || String(jsonMsg || '');
-      const rawMsg = stripMinecraftFormatting(text).trim();
+      const rawMsg = normalizeMinecraftText(jsonMsg, { maxDepth: 10, maxStrings: 80 }).trim();
       this.recordChatLine('IN', rawMsg, position);
       const myName = this.bot ? this.bot.username : null;
       if (myName && rawMsg.includes(myName)) {
         this.lastChatWithMyName = rawMsg;
         this.lastChatWithMyNameTime = Date.now();
       }
-      this.handleMessageString(text);
+      this.handleMessageString(rawMsg);
     });
 
     bot.on('chat', (username, message) => {
@@ -449,15 +501,7 @@ class BotController {
     this.setStatus('Spawned');
     this.startFoodPolling();
 
-    if (bot.username && this.botConfig.nickname !== bot.username) {
-      this.botConfig.nickname = bot.username;
-      this.botConfig.stats_username = bot.username;
-      try {
-        const { writeJsonFile } = require('./utils');
-        writeJsonFile('config.json', this.config);
-        this.logger.info(`Auto-saved in-game username: ${bot.username}`);
-      } catch (e) {}
-    }
+    this.rememberProfileName(bot.username, 'spawn');
     await sleep(Number(this.settings.post_spawn_grace_ms) || 8000);
     if (bot !== this.bot || this.disconnectHandled) return;
 
@@ -661,7 +705,7 @@ class BotController {
   }
 
   classifyDisconnect(kind, reason) {
-    const text = stripMinecraftFormatting(String(reason || '')).trim();
+    const text = normalizeMinecraftText(reason, { preserveNewlines: true }).trim();
     const lower = text.toLowerCase();
     if (!text) return { category: 'Unknown', message: 'No reason provided.' };
 
@@ -693,15 +737,25 @@ class BotController {
       return { category: 'Network', message: 'Connection timed out.' };
     }
     if (kind === 'kicked') {
-      const firstLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || text;
-      return { category: 'Server Kick', message: firstLine.slice(0, 500) };
+      return { category: 'Server Kick', message: this.cleanDisconnectMessage(text, 1200) };
     }
 
     const firstLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || text;
-    const message = firstLine
-      .replace(new RegExp(escapeRegExp(this.botConfig.username), 'gi'), this.displayName())
-      .slice(0, 500);
+    const message = this.cleanDisconnectMessage(firstLine, 500);
     return { category: kind === 'error' ? 'Bot/Error' : 'Unknown', message };
+  }
+
+  cleanDisconnectMessage(text, maxLength = 500) {
+    let message = normalizeMinecraftText(text, { preserveNewlines: true })
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (this.botConfig.username) {
+      message = message.replace(new RegExp(escapeRegExp(this.botConfig.username), 'gi'), this.displayName());
+    }
+    return message.slice(0, Math.max(1, Number(maxLength) || 500));
   }
 
   trackProxyFailure(classification) {
@@ -1147,9 +1201,10 @@ class BotController {
   }
 
   shouldPauseHomeRecoveryMovementCheck() {
-    if (this.userPaused || this.pausedAuto || this.tpaInProgress || this.isEating) return true;
+    if (this.userPaused || this.pausedAuto || this.tpaInProgress || this.isEating || this.pendingCashout) return true;
     if (this.status === 'TPA Trade' || this.status === 'Waiting Return') return true;
     if (this.status === 'Dead / Respawning') return true;
+    if (this.status === 'Waiting Axe') return true;
     return false;
   }
 
@@ -1238,10 +1293,12 @@ class BotController {
     this.stopAttack(true);
     this.sendChat(command);
     this.homeRecoveryHomeCommandSentAt = Date.now();
+    if (!this.homeRecoveryFirstCommandAt) this.homeRecoveryFirstCommandAt = this.homeRecoveryHomeCommandSentAt;
+    this.homeRecoveryAttemptCount += 1;
     this.homeRecoveryState = HOME_RECOVERY.waitHomeResult;
     this.homeRecoveryActionAt = Date.now() + this.getHomeRecoveryCommandWaitMs();
     this.setStatus('Home Recovery / Waiting');
-    this.notifyHomeRecovery(`Sent ${command}; waiting for home or maintenance chat.`, false);
+    this.notifyHomeRecovery(`Sent ${command}; waiting for home or maintenance chat. attempt=${this.homeRecoveryAttemptCount}`, false);
   }
 
   getHomeRecoveryCommandWaitMs() {
@@ -1273,10 +1330,18 @@ class BotController {
     if (this.homeRecoveryMaintenanceStartedAt > 0) return;
     if (this.homeRecoverySuppressStuckAlertUntil && Date.now() < this.homeRecoverySuppressStuckAlertUntil) return;
     if (!this.homeRecoveryHomeCommandSentAt) return;
+    const minAttempts = Math.max(1, Number(this.settings.home_recovery_critical_after_attempts) || 3);
+    if (this.homeRecoveryAttemptCount < minAttempts) {
+      this.logger.warn(
+        `Home Recovery: no confirmation after ${this.normalizedHomeCommand()} attempt ${this.homeRecoveryAttemptCount}/${minAttempts}; retrying without critical alert`
+      );
+      return;
+    }
     this.homeRecoveryStuckAfterHomeAlerted = true;
+    const stuckForMs = Date.now() - (this.homeRecoveryFirstCommandAt || this.homeRecoveryHomeCommandSentAt);
     this.manager.alertCritical(
       this,
-      `Home Recovery: still stuck after ${this.normalizedHomeCommand()}; no recovery confirmed after ${formatDuration(Date.now() - this.homeRecoveryHomeCommandSentAt)}`
+      `Home Recovery: still stuck after ${this.normalizedHomeCommand()}; no recovery confirmed after ${formatDuration(stuckForMs)} and ${this.homeRecoveryAttemptCount} attempt(s)`
     );
   }
 
@@ -1304,7 +1369,7 @@ class BotController {
 
   handleHomeRecoveryMessage(message) {
     if (this.settings.home_recovery_enabled === false) return;
-    const text = stripMinecraftFormatting(message || '').trim();
+    const text = normalizeMinecraftText(message).trim();
     if (!text) return;
     const lower = text.toLowerCase();
 
@@ -1418,6 +1483,8 @@ class BotController {
     this.homeRecoveryCurrentRetryMinutes = 0;
     this.homeRecoveryLastMessage = '';
     this.homeRecoveryHomeCommandSentAt = 0;
+    this.homeRecoveryFirstCommandAt = 0;
+    this.homeRecoveryAttemptCount = 0;
     this.homeRecoveryStuckAfterHomeAlerted = false;
     this.homeRecoverySuppressStuckAlertUntil = 0;
     this.homeRecoveryExpectedRestartUntil = 0;
@@ -1649,8 +1716,7 @@ class BotController {
 
     const replyListener = (jsonMsg) => {
       try {
-        const text = collectStrings(jsonMsg, { maxDepth: 10 }).join(' ');
-        const rawText = stripMinecraftFormatting(text).trim();
+        const rawText = normalizeMinecraftText(jsonMsg, { maxDepth: 10 }).trim();
         const classified = classifyCashoutReply(rawText, cashoutNickname, amount);
         if (!classified) return;
         rememberCashoutReply(payment, classified.message || rawText);
@@ -2348,7 +2414,7 @@ class BotController {
   }
 
   handleMessageString(message) {
-    const text = stripMinecraftFormatting(message || '');
+    const text = normalizeMinecraftText(message);
     this.handleTpaProgressMessage(text);
     const sender = parseTpaSender(text) || this.findWhitelistedTpaSender(text);
     if (sender && this.manager.isWhitelisted(sender)) {
@@ -2365,7 +2431,7 @@ class BotController {
   }
 
   recordChatLine(direction, message, kind = '') {
-    const text = stripMinecraftFormatting(message || '').trim();
+    const text = normalizeMinecraftText(message).trim();
     if (!text) return;
     const directionKey = String(direction || 'IN').toUpperCase();
     const chatKind = normalizeChatKind(kind);
@@ -2444,7 +2510,7 @@ class BotController {
 
   handleTpaProgressMessage(message) {
     if (!this.tpaInProgress || !this.pendingTpaSender) return;
-    const text = stripMinecraftFormatting(message || '').trim();
+    const text = normalizeMinecraftText(message).trim();
     if (!text) return;
     const lower = text.toLowerCase();
     if (isTpaFailureMessage(lower)) {
@@ -2481,7 +2547,7 @@ class BotController {
 
   findWhitelistedTpaSender(message) {
     if (!looksLikeTpaMessage(message)) return '';
-    const text = String(message || '').toLowerCase();
+    const text = normalizeMinecraftText(message).toLowerCase();
     for (const username of this.config.whitelist || []) {
       const name = String(username || '').trim();
       if (!name) continue;
@@ -2540,7 +2606,7 @@ class BotController {
 
     if (!this.config.server.exploit_protection) return;
     const type = String(window.type || '').toLowerCase();
-    const title = normalizeText(window.title || window.name || '');
+    const title = normalizeMinecraftText(window.title || window.name || '').trim().toLowerCase();
     const looksForced = type.includes('anvil') || title.includes('anvil') || title.includes('repair') || title.includes('smith');
     if (!looksForced) return;
 
@@ -2608,7 +2674,7 @@ function formatDuration(durationMs) {
 
 function rememberCashoutReply(payment, message) {
   if (!payment) return;
-  const text = stripMinecraftFormatting(message || '').trim();
+  const text = normalizeMinecraftText(message).trim();
   if (!text) return;
   if (!Array.isArray(payment.replies)) payment.replies = [];
   if (payment.replies[payment.replies.length - 1] !== text) payment.replies.push(text.slice(0, 500));
@@ -2616,7 +2682,7 @@ function rememberCashoutReply(payment, message) {
 }
 
 function discordInline(value, maxLength = 180) {
-  const text = stripMinecraftFormatting(value || '')
+  const text = normalizeMinecraftText(value)
     .replace(/`/g, 'ʼ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -2631,17 +2697,37 @@ function normalizeChatKind(kind) {
   return text || 'unknown';
 }
 
+function normalizeMinecraftChatEntry(entry) {
+  if (!entry || !entry.text) return null;
+  const text = normalizeMinecraftText(entry.text).trim();
+  if (!text) return null;
+  return {
+    ...entry,
+    direction: String(entry.direction || 'IN').toUpperCase(),
+    kind: normalizeChatKind(entry.kind || entry.position || entry.type || ''),
+    text: text.slice(0, 500)
+  };
+}
+
 function filterMinecraftChatEntries(entries, limit) {
   const count = Math.max(1, Math.min(80, Number(limit) || 30));
-  return (entries || [])
-    .filter((entry) => shouldShowMinecraftChatLine(entry))
-    .slice(-count);
+  const out = [];
+  let lastKey = '';
+  for (const entry of entries || []) {
+    const normalized = normalizeMinecraftChatEntry(entry);
+    if (!normalized || !shouldShowMinecraftChatLine(normalized)) continue;
+    const key = `${normalized.direction}:${normalized.kind}:${normalized.text}`;
+    if (key === lastKey) continue;
+    lastKey = key;
+    out.push(normalized);
+  }
+  return out.slice(-count);
 }
 
 function shouldShowMinecraftChatLine(entry) {
   if (!entry || !entry.text) return false;
   if (String(entry.direction || '').toUpperCase() === 'OUT') return true;
-  const text = stripMinecraftFormatting(entry.text || '').trim();
+  const text = normalizeMinecraftText(entry.text).trim();
   if (!text) return false;
   const kind = normalizeChatKind(entry.kind || entry.position || entry.type || '');
   if (kind === 'game_info') return false;
@@ -2651,12 +2737,16 @@ function shouldShowMinecraftChatLine(entry) {
 }
 
 function isMoneyOnlyChatLine(text) {
-  const value = stripMinecraftFormatting(text || '').trim();
-  return /^\$?\s*[\d,.]+(?:\s*[kmbt])?$/i.test(value);
+  const value = normalizeMinecraftText(text).replace(/\s+/g, ' ').trim();
+  if (!value) return false;
+  const tokens = value.split(/\s+/).filter(Boolean);
+  return tokens.length > 0 &&
+    tokens.every((token) => token === '$' || /^\$?[\d,.]+(?:[kmbt])?$/i.test(token)) &&
+    tokens.some((token) => /^[\d,.]+(?:[kmbt])?$/i.test(token.replace(/^\$/, '')));
 }
 
 function isExpandedMoneyActionbarLine(text) {
-  const value = stripMinecraftFormatting(text || '').replace(/\s+/g, ' ').trim();
+  const value = normalizeMinecraftText(text).replace(/\s+/g, ' ').trim();
   if (!value || !value.includes('$')) return false;
   if (!/(#[0-9a-f]{6}|\bwhite\b|\bgray\b|\bgreen\b|\byellow\b|\bgold\b)/i.test(value)) return false;
 
@@ -2675,10 +2765,7 @@ function isExpandedMoneyActionbarLine(text) {
 
 function describeWindow(window) {
   if (!window) return 'unknown window';
-  const title = stripMinecraftFormatting([
-    ...collectStrings(window.title, { maxDepth: 6, maxStrings: 40 }),
-    ...collectStrings(window.name, { maxDepth: 6, maxStrings: 40 })
-  ].join(' ')).trim();
+  const title = normalizeMinecraftText([window.title, window.name], { maxDepth: 6, maxStrings: 40 }).trim();
   const type = String(window.type || '').trim();
   const slotCount = Array.isArray(window.slots) ? window.slots.length : 0;
   return [type || 'window', title ? `title=${title}` : '', `slots=${slotCount}`].filter(Boolean).join(' ');
@@ -2693,6 +2780,12 @@ function isMicrosoftDeviceCodeExpired(lowerReason) {
   );
 }
 
+function cleanProfileName(value) {
+  const text = String(value || '').trim();
+  if (!text || text.includes('@')) return '';
+  return /^[A-Za-z0-9_]{1,16}$/.test(text) ? text : '';
+}
+
 function isServerSecurityKick(kind, lowerReason) {
   if (kind !== 'kicked') return false;
   const text = String(lowerReason || '').toLowerCase();
@@ -2702,7 +2795,7 @@ function isServerSecurityKick(kind, lowerReason) {
 }
 
 function parseTpaSender(message) {
-  const text = stripMinecraftFormatting(message || '');
+  const text = normalizeMinecraftText(message);
   const patterns = [
     /([A-Za-z0-9_]{1,16})\s+has requested to teleport to you/i,
     /([A-Za-z0-9_]{1,16})\s+wants to teleport to you/i,
@@ -2725,7 +2818,7 @@ function parseTpaSender(message) {
 }
 
 function looksLikeTpaMessage(message) {
-  return /teleport|tpa|tpaccept|телепорт/i.test(String(message || ''));
+  return /teleport|tpa|tpaccept|телепорт/i.test(normalizeMinecraftText(message));
 }
 
 function isTpaAcceptedMessage(lowerMessage) {
@@ -2766,7 +2859,7 @@ function isTpaFailureMessage(lowerMessage) {
 }
 
 function classifyCashoutReply(message, targetNickname, amount = 0) {
-  const text = stripMinecraftFormatting(message || '').trim();
+  const text = normalizeMinecraftText(message).trim();
   if (!text || text.startsWith('<')) return null;
   const lower = text.toLowerCase();
   const target = String(targetNickname || '').trim().toLowerCase();
@@ -2874,7 +2967,8 @@ function readMinecraftChatLog(username, limit, logger) {
       for (const line of text.split(/\r?\n/).filter(Boolean)) {
         try {
           const entry = JSON.parse(line);
-          if (entry && entry.text) entries.push(entry);
+          const normalized = normalizeMinecraftChatEntry(entry);
+          if (normalized) entries.push(normalized);
         } catch (error) {}
       }
     }

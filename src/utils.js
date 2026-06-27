@@ -127,6 +127,270 @@ function collectStrings(value, options = {}) {
   return out.filter(Boolean);
 }
 
+const CHAT_COMPONENT_STYLE_KEYS = new Set([
+  'bold',
+  'italic',
+  'underlined',
+  'strikethrough',
+  'obfuscated',
+  'color',
+  'font',
+  'insertion',
+  'clickEvent',
+  'hoverEvent'
+]);
+
+const MINECRAFT_STYLE_WORDS = [
+  'black',
+  'dark_blue',
+  'dark_green',
+  'dark_aqua',
+  'dark_red',
+  'dark_purple',
+  'gold',
+  'gray',
+  'dark_gray',
+  'blue',
+  'green',
+  'aqua',
+  'red',
+  'light_purple',
+  'yellow',
+  'white',
+  'reset',
+  'bold',
+  'italic',
+  'underlined',
+  'strikethrough',
+  'obfuscated'
+];
+
+const MINECRAFT_NBT_WORDS = [
+  'compound',
+  'list',
+  'string',
+  'byte',
+  'short',
+  'int',
+  'long',
+  'float',
+  'double',
+  'end'
+];
+
+const MINECRAFT_STYLE_WORD_RE = new RegExp(`\\b(?:${MINECRAFT_STYLE_WORDS.join('|')})\\b`, 'gi');
+const MINECRAFT_NBT_WORD_RE = new RegExp(`\\b(?:${MINECRAFT_NBT_WORDS.join('|')})\\b`, 'gi');
+const MINECRAFT_FLAT_COMPONENT_WORD_RE = new RegExp(`\\b(?:${MINECRAFT_STYLE_WORDS.concat(MINECRAFT_NBT_WORDS).join('|')})\\b`, 'gi');
+const MINECRAFT_HEX_COLOR_RE = /#[0-9a-f]{6}\b/gi;
+
+function collectMinecraftText(value, options = {}) {
+  const maxDepth = options.maxDepth || 16;
+  const maxStrings = options.maxStrings || 500;
+  const out = [];
+  const seen = new WeakSet();
+
+  function pushText(text) {
+    if (out.length >= maxStrings) return;
+    const clean = stripMinecraftFormatting(text);
+    if (clean) out.push(clean);
+  }
+
+  function walk(inner, depth) {
+    if (out.length >= maxStrings || depth > maxDepth || inner == null) return;
+
+    if (typeof inner === 'string') {
+      const parsed = parseMaybeJsonString(inner);
+      if (parsed) {
+        walk(parsed, depth + 1);
+        return;
+      }
+      pushText(inner);
+      return;
+    }
+
+    if (Buffer.isBuffer(inner)) {
+      walk(inner.toString('utf8'), depth + 1);
+      return;
+    }
+
+    if (Array.isArray(inner)) {
+      for (const item of inner) walk(item, depth + 1);
+      return;
+    }
+
+    if (typeof inner !== 'object') return;
+    if (seen.has(inner)) return;
+    seen.add(inner);
+
+    if (Object.prototype.hasOwnProperty.call(inner, 'type') && Object.prototype.hasOwnProperty.call(inner, 'value')) {
+      walk(inner.value, depth + 1);
+      return;
+    }
+
+    let usedComponentFields = false;
+    for (const key of ['text', 'translate', 'with', 'extra']) {
+      if (Object.prototype.hasOwnProperty.call(inner, key)) {
+        usedComponentFields = true;
+        walk(inner[key], depth + 1);
+      }
+    }
+    if (usedComponentFields) return;
+
+    for (const [key, child] of Object.entries(inner)) {
+      if (CHAT_COMPONENT_STYLE_KEYS.has(key)) continue;
+      walk(child, depth + 1);
+    }
+  }
+
+  walk(value, 0);
+  return out;
+}
+
+function normalizeMinecraftText(value, options = {}) {
+  if (value == null) return '';
+
+  const candidates = [];
+  const pushCandidate = (text) => {
+    if (text == null) return;
+    const valueText = String(text);
+    if (!valueText.trim()) return;
+    if (!candidates.includes(valueText)) candidates.push(valueText);
+  };
+
+  if (value instanceof Error) {
+    pushCandidate(value.stack || value.message);
+  } else if (Buffer.isBuffer(value)) {
+    pushCandidate(value.toString('utf8'));
+  } else if (typeof value === 'string') {
+    const parsed = parseMaybeJsonString(value);
+    if (parsed) {
+      pushCandidate(collectMinecraftText(parsed, options).join(''));
+      pushCandidate(collectStrings(parsed, options).join(' '));
+    }
+    pushCandidate(value);
+  } else {
+    pushCandidate(customStringValue(value));
+    pushCandidate(collectMinecraftText(value, options).join(''));
+    pushCandidate(collectStrings(value, options).join(' '));
+    pushCandidate(safeStringify(value));
+  }
+
+  const cleaned = [];
+  for (const candidate of candidates) {
+    const text = cleanMinecraftFlatText(candidate, options);
+    if (text && !cleaned.includes(text)) cleaned.push(text);
+  }
+
+  return cleaned.find((text) => !looksSerializedObjectText(text)) || cleaned[0] || '';
+}
+
+function customStringValue(value) {
+  if (!value || typeof value !== 'object') return '';
+  const toString = value.toString;
+  if (typeof toString !== 'function') return '';
+  if (toString === Object.prototype.toString || toString === Array.prototype.toString) return '';
+  try {
+    const text = toString.call(value);
+    if (typeof text !== 'string') return '';
+    const trimmed = text.trim();
+    if (!trimmed || trimmed === '[object Object]') return '';
+    return trimmed;
+  } catch (error) {
+    return '';
+  }
+}
+
+function cleanMinecraftFlatText(value, options = {}) {
+  const preserveNewlines = Boolean(options.preserveNewlines);
+  let text = stripMinecraftFormatting(value)
+    .replace(/\u0000/g, ' ')
+    .replace(/\r\n?/g, '\n');
+  if (!text.trim()) return '';
+
+  const flattened = looksFlattenedMinecraftComponent(text);
+  if (flattened) {
+    text = text
+      .replace(MINECRAFT_HEX_COLOR_RE, ' ')
+      .replace(MINECRAFT_FLAT_COMPONENT_WORD_RE, ' ')
+      .replace(/\b(?:true|false)\b/gi, ' ')
+      .replace(/\b0\b/g, ' ');
+  }
+
+  if (preserveNewlines) {
+    return text
+      .split('\n')
+      .map((line) => cleanMinecraftFlatLine(line, flattened))
+      .filter(Boolean)
+      .filter((line, index, lines) => index === 0 || line !== lines[index - 1])
+      .join('\n')
+      .trim();
+  }
+
+  return cleanMinecraftFlatLine(text, flattened);
+}
+
+function cleanMinecraftFlatLine(line, flattened) {
+  let text = String(line || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  if (flattened) text = dedupeRepeatedWordRuns(text);
+  return text.trim();
+}
+
+function looksFlattenedMinecraftComponent(value) {
+  const text = stripMinecraftFormatting(value || '');
+  if (!text.trim()) return false;
+  const nbtCount = countMatches(text, MINECRAFT_NBT_WORD_RE);
+  const styleCount = countMatches(text, MINECRAFT_STYLE_WORD_RE);
+  const hexCount = countMatches(text, MINECRAFT_HEX_COLOR_RE);
+  const zeroCount = countMatches(text, /\b0\b/g);
+  if (nbtCount >= 2) return true;
+  if (hexCount > 0) return true;
+  if (zeroCount >= 3 && styleCount > 0) return true;
+  return zeroCount >= 8;
+}
+
+function countMatches(text, pattern) {
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const re = new RegExp(pattern.source, flags);
+  return (String(text || '').match(re) || []).length;
+}
+
+function dedupeRepeatedWordRuns(text) {
+  const tokens = String(text || '').split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return String(text || '').trim();
+
+  let changed = true;
+  let guard = 0;
+  while (changed && guard < 80) {
+    changed = false;
+    guard += 1;
+    const maxRun = Math.min(18, Math.floor(tokens.length / 2));
+    outer:
+    for (let size = maxRun; size >= 1; size -= 1) {
+      for (let index = 0; index + size * 2 <= tokens.length; index += 1) {
+        if (!sameTokenRun(tokens, index, index + size, size)) continue;
+        tokens.splice(index + size, size);
+        changed = true;
+        break outer;
+      }
+    }
+  }
+
+  return tokens.join(' ');
+}
+
+function sameTokenRun(tokens, left, right, size) {
+  for (let offset = 0; offset < size; offset += 1) {
+    if (tokens[left + offset] !== tokens[right + offset]) return false;
+  }
+  return true;
+}
+
+function looksSerializedObjectText(value) {
+  const text = String(value || '').trim();
+  return /^[{[]/.test(text) || /\b(?:text|translate|extra|color|type|value)["':=]/i.test(text);
+}
+
 function parseSelfDestructTimerFromItem(item) {
   if (!item) return { found: false, label: '-', ms: null, expired: false };
   const haystack = collectStrings(item, { maxDepth: 14, maxStrings: 500 }).join('\n');
@@ -267,13 +531,7 @@ function findBalanceField(value) {
 
 function parseKickReason(reason) {
   if (reason == null) return '';
-  if (reason instanceof Error) return reason.stack || reason.message;
-  if (typeof reason === 'string') {
-    const parsed = parseMaybeJsonString(reason);
-    if (parsed) return collectStrings(parsed).join(' ').trim() || reason;
-    return stripMinecraftFormatting(reason);
-  }
-  return collectStrings(reason).join(' ').trim() || safeStringify(reason);
+  return normalizeMinecraftText(reason, { preserveNewlines: true });
 }
 
 function packetChannelName(packet) {
@@ -351,6 +609,7 @@ function shouldIgnorePacketTrace(direction, packetName) {
 module.exports = {
   PacketTrace,
   clamp,
+  collectMinecraftText,
   collectStrings,
   degreesToRadians,
   ensureDir,
@@ -359,6 +618,7 @@ module.exports = {
   formatDuration,
   formatMoney,
   getByPath,
+  normalizeMinecraftText,
   normalizeText,
   parseKickReason,
   parseSelfDestructTimerFromItem,
