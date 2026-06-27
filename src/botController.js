@@ -292,16 +292,20 @@ class BotController {
       }
     };
 
-    const proxyAgent = createHttpAgent(this.proxy);
-    if (proxyAgent) {
-      options.agent = proxyAgent;
+    let microsoftAuthViaProxy = false;
+    if (this.settings.proxy_microsoft_auth === true) {
+      const proxyAgent = createHttpAgent(this.proxy);
+      if (proxyAgent) {
+        options.agent = proxyAgent;
+        microsoftAuthViaProxy = true;
+      }
     }
     const proxyConnect = createMineflayerConnect(this.proxy, server.host, server.port, this.logger);
     if (proxyConnect) options.connect = proxyConnect;
 
     try {
       this.logger.info(
-        `Connecting as ${this.botConfig.username} to ${server.host}:${server.port} version=${options.version} proxy=${getProxyLabel(this.proxy)} mcConnect=${proxyConnect ? 'proxy' : 'direct'}`
+        `Connecting as ${this.botConfig.username} to ${server.host}:${server.port} version=${options.version} proxy=${getProxyLabel(this.proxy)} mcConnect=${proxyConnect ? 'proxy' : 'direct'} msAuth=${microsoftAuthViaProxy ? 'proxy' : 'direct'}`
       );
       this.bot = mineflayer.createBot(options);
       this.attachBotEvents(this.bot);

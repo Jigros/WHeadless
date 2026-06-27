@@ -1,5 +1,8 @@
 'use strict';
 
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const { BotController } = require('./botController');
 const { Dashboard } = require('./dashboard');
 const { DonutApi } = require('./donutApi');
@@ -242,13 +245,22 @@ class Manager {
     const existingCtrl = this.controllers[ctrlIndex];
 
     if (actionText === 'DELETE') {
-      if (index > -1) this.config.bots.splice(index, 1);
-      writeJsonFile('config.json', this.config);
+      const botConfig = index > -1 ? this.config.bots[index] : { username };
+      const cleanupNames = [
+        username,
+        botConfig.username,
+        botConfig.nickname,
+        botConfig.stats_username,
+        existingCtrl && existingCtrl.realUsername
+      ].filter(Boolean);
       if (existingCtrl) {
         await existingCtrl.shutdown();
         this.controllers.splice(ctrlIndex, 1);
       }
-      return `Deleted bot ${username}`;
+      const cleanup = this.deleteBotLocalData(cleanupNames);
+      if (index > -1) this.config.bots.splice(index, 1);
+      writeJsonFile('config.json', this.config);
+      return `Deleted bot ${username}. Removed auth files: ${cleanup.auth}; chat logs: ${cleanup.chat}`;
     }
 
     if (actionText === 'OFF') {
@@ -356,6 +368,70 @@ class Manager {
     }
     return `Updated and restarted bot ${username}`;
   }
+
+  deleteBotLocalData(names) {
+    const uniqueNames = [...new Set((names || []).map((name) => String(name || '').trim()).filter(Boolean))];
+    return {
+      auth: this.deleteBotAuthCache(uniqueNames),
+      chat: this.deleteBotChatLogs(uniqueNames)
+    };
+  }
+
+  deleteBotAuthCache(names) {
+    const dir = this.config.auth && this.config.auth.profiles_folder;
+    if (!dir || !fs.existsSync(dir)) return 0;
+
+    const prefixes = new Set(names.map((name) => this.prismarineAuthHash(name)));
+    let removed = 0;
+    for (const fileName of fs.readdirSync(dir)) {
+      if (!fileName.endsWith('-cache.json')) continue;
+      const prefix = fileName.split('_')[0];
+      if (!prefixes.has(prefix)) continue;
+
+      const filePath = path.join(dir, fileName);
+      try {
+        fs.rmSync(filePath, { force: true });
+        removed += 1;
+        this.logger.info(`Deleted auth cache ${filePath}`);
+      } catch (error) {
+        this.logger.warn(`Failed to delete auth cache ${filePath}: ${error.message || error}`);
+      }
+    }
+    return removed;
+  }
+
+  deleteBotChatLogs(names) {
+    const dir = path.join(process.cwd(), 'logs', 'minecraft-chat');
+    if (!fs.existsSync(dir)) return 0;
+
+    const prefixes = new Set(names.map((name) => `${safeLogName(name)}-`));
+    let removed = 0;
+    for (const fileName of fs.readdirSync(dir)) {
+      if (!fileName.endsWith('.jsonl')) continue;
+      if (![...prefixes].some((prefix) => fileName.startsWith(prefix))) continue;
+
+      const filePath = path.join(dir, fileName);
+      try {
+        fs.rmSync(filePath, { force: true });
+        removed += 1;
+        this.logger.info(`Deleted chat log ${filePath}`);
+      } catch (error) {
+        this.logger.warn(`Failed to delete chat log ${filePath}: ${error.message || error}`);
+      }
+    }
+    return removed;
+  }
+
+  prismarineAuthHash(username) {
+    return crypto.createHash('sha1')
+      .update(username ?? '', 'binary')
+      .digest('hex')
+      .slice(0, 6);
+  }
+}
+
+function safeLogName(value) {
+  return String(value || 'unknown').replace(/[^a-z0-9_.@-]+/gi, '_').slice(0, 80) || 'unknown';
 }
 
 module.exports = {

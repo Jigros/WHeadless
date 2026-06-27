@@ -53,6 +53,7 @@ const DEFAULT_CONFIG = {
     cashout_retry_after_reconnect: true,
     cashout_reconnect_retry_delay_ms: 5000,
     tpa_reconnect_on_no_confirmation: true,
+    proxy_microsoft_auth: false,
     attack_interval_ms: 150,
     axe_scan_interval_ms: 60000,
     balance_interval_ms: 300000,
