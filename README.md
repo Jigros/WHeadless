@@ -141,11 +141,11 @@ User=wheadless
 Group=wheadless
 WorkingDirectory=/opt/wheadless
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/npm start
+ExecStart=/usr/bin/node src/index.js
 Restart=always
 RestartSec=15
 KillSignal=SIGTERM
-TimeoutStopSec=30
+TimeoutStopSec=60
 
 # Basic hardening. Keep ReadWritePaths because the app writes auth/data/logs/config updates.
 NoNewPrivileges=true

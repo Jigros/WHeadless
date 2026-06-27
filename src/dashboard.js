@@ -42,6 +42,8 @@ class Dashboard {
     this.refreshTimer = null;
     this.refreshing = false;
     this.ready = false;
+    this.targetBalanceLabel = '-';
+    this.targetBalanceAt = 0;
   }
 
   async start() {
@@ -1494,11 +1496,24 @@ class Dashboard {
         const result = await this.manager.donutApi.getBalance(cashoutTarget, { botKey: 'dashboard', displayName: 'Dashboard' });
         if (result.ok && Number.isFinite(result.balance)) {
           this.targetBalanceLabel = `$${formatCompactMoney(result.balance)}`;
+          this.targetBalanceAt = Date.now();
         } else {
-          this.targetBalanceLabel = '?';
+          const gameResult = isTransientDashboardBalanceApiError(result)
+            ? await this.manager.getGameBalanceForTarget(cashoutTarget)
+            : null;
+          if (gameResult && gameResult.ok && Number.isFinite(gameResult.balance)) {
+            this.targetBalanceLabel = `$${formatCompactMoney(gameResult.balance)}`;
+            this.targetBalanceAt = Date.now();
+            this.logger.info(`Cashout target balance from game command: ${cashoutTarget} ${this.targetBalanceLabel}`);
+          } else if (!this.hasCachedTargetBalanceFor(result)) {
+            this.targetBalanceLabel = '?';
+          } else {
+            this.logger.debug(`Keeping cached cashout target balance during ${result.code || 'API error'}`);
+          }
         }
       } else {
         this.targetBalanceLabel = '-';
+        this.targetBalanceAt = 0;
       }
 
       if (!this.message) await this.ensureDashboardMessage();
@@ -1571,6 +1586,15 @@ class Dashboard {
     return Number.isFinite(number) ? formatCompactMoney(number) : value;
   }
 
+  hasCachedTargetBalanceFor(result) {
+    if (!isTransientDashboardBalanceApiError(result)) return false;
+    if (!this.targetBalanceLabel || this.targetBalanceLabel === '-' || this.targetBalanceLabel === '?') return false;
+    const cachedAt = Number(this.targetBalanceAt) || 0;
+    if (!cachedAt) return false;
+    const maxAgeMs = dashboardBalanceCacheMaxAgeMs(this.config);
+    return Date.now() - cachedAt <= maxAgeMs;
+  }
+
   buildFarmCoordsText() {
     const snapshots = this.manager.getSnapshots();
     const lines = snapshots.map((bot) => {
@@ -1630,6 +1654,17 @@ class Dashboard {
       this.logger.warn('Failed to send Discord alert', error);
     }
   }
+}
+
+function isTransientDashboardBalanceApiError(result) {
+  if (!result || result.ok) return false;
+  const code = String(result.code || '');
+  return code === 'API_ERROR' || /^HTTP_5\d\d$/.test(code);
+}
+
+function dashboardBalanceCacheMaxAgeMs(config) {
+  const configured = Number(config && config.bot_defaults && config.bot_defaults.cashout_balance_cache_max_age_ms);
+  return Number.isFinite(configured) ? Math.max(0, configured) : 60 * 60 * 1000;
 }
 
 module.exports = {

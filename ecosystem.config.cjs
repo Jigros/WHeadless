@@ -10,6 +10,7 @@ module.exports = {
       watch: false,
       max_memory_restart: '700M',
       restart_delay: 10000,
+      kill_timeout: 30000,
       out_file: './logs/pm2-out.log',
       error_file: './logs/pm2-error.log',
       env: {

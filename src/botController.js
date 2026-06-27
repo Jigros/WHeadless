@@ -7,6 +7,7 @@ const { createHttpAgent, createMineflayerConnect, getProxyLabel } = require('./p
 const {
   collectStrings,
   formatCompactMoney,
+  formatMoney,
   normalizeMinecraftText,
   normalizeText,
   parseKickReason,
@@ -99,6 +100,8 @@ const PROXY_LIMBO_MARKER = 'proxy limbo';
 const SERVER_RESTARTING_MARKER = 'server is restarting';
 const SERVER_UPDATING_MARKER = 'servers are updating, do not teleport';
 const SERVER_RETURNING_MARKER = 'your region started back up';
+const DEFAULT_CASHOUT_BALANCE_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
+const DEFAULT_HOME_RECOVERY_REPEAT_COOLDOWN_MS = 5 * 60 * 1000;
 
 class BotController {
   constructor({ botConfig, config, donutApi, logger, manager }) {
@@ -129,6 +132,7 @@ class BotController {
     this.lastMsaCodeAt = 0;
     this.announceNextLogin = Boolean(botConfig.announce_login_on_next_start);
     this.reconnectTimer = null;
+    this.lastConnectionClosedAt = 0;
     this.attackTimer = null;
     this.attackLoopActive = false;
     this.balanceTimer = null;
@@ -136,6 +140,8 @@ class BotController {
     this.axeRecoveryTimer = null;
     this.foodTimer = null;
     this.playerAlertTimer = null;
+    this.farmRefreshTimer = null;
+    this.farmRefreshInProgress = false;
     this.homeRecoveryTimer = null;
     this.scheduledReconnectTimer = null;
     this.nextScheduledReconnectAt = 0;
@@ -156,6 +162,7 @@ class BotController {
     this.tpaAttemptNotified = false;
     this.tpaFailureNotified = false;
     this.pendingCashout = null;
+    this.pendingGameBalances = new Map();
     this.pendingCashoutRetry = null;
     this.returnResolver = null;
     this.ticketRetryAt = 0;
@@ -177,11 +184,13 @@ class BotController {
     this.homeRecoveryFirstCommandAt = 0;
     this.homeRecoveryAttemptCount = 0;
     this.homeRecoveryStuckAfterHomeAlerted = false;
+    this.homeRecoveryNextStartAllowedAt = 0;
     this.lastHomeRecoveryDiscordAt = new Map();
     
     this.sessionEarned = 0;
     this.sessionStartTime = Date.now();
     this.lastBalance = null;
+    this.lastBalanceAt = 0;
     this.incomeLabel = '-';
     this.profitSamples = [];
     this.currentPerHour = 0;
@@ -298,6 +307,16 @@ class BotController {
       return;
     }
 
+    const waitBeforeConnectMs = this.connectDelayRemainingMs();
+    if (waitBeforeConnectMs > 0) {
+      const seconds = Math.max(1, Math.ceil(waitBeforeConnectMs / 1000));
+      this.setStatus(`Reconnect Wait (${seconds}s)`);
+      this.logger.info(`Delaying connect for ${seconds}s after recent close/disconnect`);
+      this.clearReconnectTimer();
+      this.reconnectTimer = setTimeout(() => this.connect(), waitBeforeConnectMs);
+      return;
+    }
+
     if (this.ticketRetryAt && Date.now() < this.ticketRetryAt) {
       const waitMs = this.ticketRetryAt - Date.now();
       const seconds = Math.max(1, Math.ceil(waitMs / 1000));
@@ -362,6 +381,17 @@ class BotController {
       this.bot = null;
       this.scheduleReconnect('createBot failed');
     }
+  }
+
+  getReconnectPreConnectDelayMs() {
+    const delay = Number(this.settings.reconnect_pre_connect_delay_ms);
+    return Math.max(0, Number.isFinite(delay) ? delay : 5000);
+  }
+
+  connectDelayRemainingMs(now = Date.now()) {
+    const delayMs = this.getReconnectPreConnectDelayMs();
+    if (!delayMs || !this.lastConnectionClosedAt) return 0;
+    return Math.max(0, this.lastConnectionClosedAt + delayMs - now);
   }
 
   attachBotEvents(bot) {
@@ -514,6 +544,7 @@ class BotController {
     this.startHomeRecoveryPolling();
     this.startPlayerAlertPolling();
     this.scheduleScheduledReconnect();
+    this.scheduleFarmRefresh();
     this.refreshBalance().catch((error) => this.logger.warn('Initial balance refresh failed', error));
 
     const ok = await this.checkAxe();
@@ -570,7 +601,7 @@ class BotController {
     try {
       const yaw = yawForCardinal(this.config.server.target_cardinal_direction || 'SOUTH');
       const configuredPitch = Number(this.config.server.pitch_degrees);
-      const pitchDegrees = Number.isFinite(configuredPitch) ? Math.abs(configuredPitch) : 89;
+      const pitchDegrees = Number.isFinite(configuredPitch) ? configuredPitch : -89;
       const pitch = (pitchDegrees * Math.PI) / 180;
       await this.bot.look(yaw, pitch, true);
       this.logger.info(`Farm camera locked yaw=${radiansToDegrees(yaw).toFixed(1)} pitch=${radiansToDegrees(pitch).toFixed(1)}`);
@@ -583,7 +614,7 @@ class BotController {
     if (!this.bot || !this.bot.entity) return;
     const targetYaw = yawForCardinal(this.config.server.target_cardinal_direction || 'SOUTH');
     const configuredPitch = Number(this.config.server.pitch_degrees);
-    const targetPitch = ((Number.isFinite(configuredPitch) ? Math.abs(configuredPitch) : 89) * Math.PI) / 180;
+    const targetPitch = ((Number.isFinite(configuredPitch) ? configuredPitch : -89) * Math.PI) / 180;
     const yawDiff = Math.abs(normalizeRadians((this.bot.entity.yaw || 0) - targetYaw));
     const pitchDiff = Math.abs((this.bot.entity.pitch || 0) - targetPitch);
     if (yawDiff < 0.03 && pitchDiff < 0.03) return;
@@ -600,6 +631,7 @@ class BotController {
   handleDisconnect(kind, reason) {
     if (this.disconnectHandled) return;
     this.disconnectHandled = true;
+    this.lastConnectionClosedAt = Date.now();
 
     const reasonText = parseKickReason(reason) || this.lastKickReason || '';
     this.stopRuntime(false);
@@ -630,7 +662,7 @@ class BotController {
       if (kind === 'kicked') emoji = '🚫';
       if (kind === 'error') emoji = '❌';
       const display = this.displayName();
-      this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\``);
+      this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\`${this.disconnectDiagnosticSuffix(kind, reasonText, classification)}`);
     }
 
     if (kind === 'kicked' && lowerReason.includes('already online')) {
@@ -700,6 +732,30 @@ class BotController {
     this.logger.warn(`Disconnected bot=${this.displayName()} kind=${kind} category=${classification.category} phase=${this.phase} reason=${classification.message}`);
   }
 
+  disconnectDiagnosticSuffix(kind, reasonText, classification) {
+    const lines = [
+      `phase=${this.phase}`,
+      `status=${this.status}`,
+      `proxy=${getProxyLabel(this.proxy)}`,
+      `mcUser=${this.bot && this.bot.username ? this.bot.username : '-'}`,
+      `realUser=${this.realUsername || '-'}`,
+      `manual=${Boolean(this.manualClose)}`,
+      `userPaused=${Boolean(this.userPaused)}`,
+      `pausedAuto=${Boolean(this.pausedAuto)}`,
+      `reconnectOnKick=${this.settings.reconnect_on_kick !== false}`,
+      `preConnectDelay=${this.getReconnectPreConnectDelayMs()}ms`
+    ];
+    if (this.lastMsaCodeAt) {
+      lines.push(`lastMsaCode=${formatDuration(Date.now() - this.lastMsaCodeAt)} ago`);
+    }
+    const raw = this.cleanDisconnectMessage(reasonText, 700);
+    if (raw && raw !== classification.message) lines.push(`raw=${raw.replace(/\n/g, ' | ')}`);
+    if (classification.category === 'Minecraft Profile') {
+      lines.push('note=Microsoft auth succeeded, but Mojang/Minecraft profile lookup failed. If the next login works, treat this as transient auth/profile-service failure.');
+    }
+    return `\nDiagnostics: \`${discordInline(lines.join(' | '), 900)}\``;
+  }
+
   formatDisconnectReason(kind, reason) {
     return this.classifyDisconnect(kind, reason).message;
   }
@@ -719,7 +775,7 @@ class BotController {
       return { category: 'Proxy', message: 'Proxy connection failed or timed out.' };
     }
     if (lower.includes('failed to obtain profile data') && lower.includes('does the account own minecraft')) {
-      return { category: 'Minecraft Profile', message: 'Microsoft account authenticated, but Minecraft Java profile was not found. Check that this account owns Minecraft Java Edition.' };
+      return { category: 'Minecraft Profile', message: 'Microsoft account authenticated, but Minecraft Java profile lookup failed. This can be transient; if it repeats for the same account, check that the account owns Minecraft Java Edition.' };
     }
     if (isServerSecurityKick(kind, lower)) {
       return { category: 'Server Security', message: 'DonutSMP blocked this login as a possible unauthorized login. Confirm it with the button in this account Discord DMs, then turn the bot ON again.' };
@@ -785,6 +841,7 @@ class BotController {
 
   forceClose() {
     const bot = this.bot;
+    this.lastConnectionClosedAt = Date.now();
     this.bot = null;
     if (!bot) return;
     try {
@@ -860,6 +917,7 @@ class BotController {
   scheduledReconnectBusyReason() {
     if (this.tpaInProgress) return 'TPA in progress';
     if (this.isEating) return 'eating';
+    if (this.farmRefreshInProgress) return 'farm refresh';
     if (this.homeRecoveryState !== HOME_RECOVERY.monitoring) return 'home recovery';
     if (this.status === 'TPA Trade' || this.status === 'Waiting Return') return this.status;
     if (this.status === 'Dead / Respawning') return this.status;
@@ -877,6 +935,84 @@ class BotController {
     this.logger.info(`Scheduled reconnect deferred for ${Math.round(retryMs / 1000)}s: ${reason}`);
   }
 
+  clearFarmRefreshTimer() {
+    if (this.farmRefreshTimer) clearTimeout(this.farmRefreshTimer);
+    this.farmRefreshTimer = null;
+  }
+
+  scheduleFarmRefresh(delayMs = null) {
+    this.clearFarmRefreshTimer();
+    if (this.settings.farm_refresh_enabled === false) return;
+    if (this.userPaused || this.pausedAuto || this.disconnectHandled || !this.bot) return;
+
+    const interval = Math.max(60 * 1000, Number(this.settings.farm_refresh_interval_ms) || 60 * 60 * 1000);
+    const delay = Number.isFinite(Number(delayMs)) ? Math.max(1000, Number(delayMs)) : interval;
+    this.farmRefreshTimer = setTimeout(() => {
+      this.farmRefreshTimer = null;
+      this.runFarmRefresh().catch((error) => this.logger.warn(`Farm refresh failed: ${error.message || error}`));
+    }, delay);
+    this.logger.info(`Farm refresh scheduled in ${Math.round(delay / 1000)}s`);
+  }
+
+  farmRefreshBusyReason() {
+    if (this.userPaused || this.pausedAuto || this.disconnectHandled || !this.bot) return 'offline/paused';
+    if (this.farmRefreshInProgress) return 'already running';
+    if (this.tpaInProgress) return 'TPA in progress';
+    if (this.isEating) return 'eating';
+    if (this.pendingCashout) return 'cashout in progress';
+    if (this.homeRecoveryState !== HOME_RECOVERY.monitoring) return 'home recovery';
+    if (this.status === 'TPA Trade' || this.status === 'Waiting Return') return this.status;
+    if (this.status === 'Dead / Respawning') return this.status;
+    return '';
+  }
+
+  async runFarmRefresh() {
+    const busyReason = this.farmRefreshBusyReason();
+    if (busyReason) {
+      const retryMs = Math.max(60 * 1000, Number(this.settings.scheduled_reconnect_busy_retry_ms) || 5 * 60 * 1000);
+      this.logger.info(`Farm refresh deferred for ${Math.round(retryMs / 1000)}s: ${busyReason}`);
+      this.scheduleFarmRefresh(retryMs);
+      return false;
+    }
+
+    const home2 = this.normalizedTradeHomeCommand();
+    const home1 = this.normalizedHomeCommand();
+    if (!home2 || !home1) {
+      this.logger.warn('Farm refresh skipped: home_trade_command or home_farm_command missing');
+      this.scheduleFarmRefresh();
+      return false;
+    }
+
+    this.farmRefreshInProgress = true;
+    const wasFarming = this.attackLoopActive || this.status === 'Farming';
+    try {
+      this.logger.info(`Farm refresh: ${home2} -> wait -> ${home1}`);
+      this.manager.dashboard?.sendLog(`♻️ \`${this.displayName()}\` refreshing farm timing: \`${home2}\` for 6s, then \`${home1}\`.`);
+      this.stopAttack(true);
+      this.closeCurrentWindow('before farm refresh');
+      this.setStatus('Farm Refresh / Home 2');
+      this.sendChat(home2);
+      await sleep(Math.max(1000, Number(this.settings.farm_refresh_home2_wait_ms) || 6000));
+      if (!this.bot || this.disconnectHandled || this.userPaused) return false;
+
+      this.setStatus('Farm Refresh / Home 1');
+      this.sendChat(home1);
+      await sleep(Math.max(1000, Number(this.settings.farm_refresh_home1_wait_ms) || Number(this.settings.teleport_wait_ms) || 6500));
+      if (!this.bot || this.disconnectHandled || this.userPaused) return false;
+
+      await this.lockFarmCamera();
+      this.markHomeRecoveryMovement();
+      if (wasFarming || this.settings.farming_enabled !== false) {
+        await this.startFarming();
+      }
+      return true;
+    } finally {
+      this.farmRefreshInProgress = false;
+      if (this.status === 'Farm Refresh / Home 2' || this.status === 'Farm Refresh / Home 1') this.setStatus('Ready');
+      this.scheduleFarmRefresh();
+    }
+  }
+
   stopRuntime(sendCancel = true) {
     this.stopAttack(sendCancel);
     if (this.cameraTimer) clearInterval(this.cameraTimer);
@@ -885,6 +1021,7 @@ class BotController {
     this.clearAxeRecoveryTimer();
     if (this.foodTimer) clearInterval(this.foodTimer);
     if (this.playerAlertTimer) clearInterval(this.playerAlertTimer);
+    this.clearFarmRefreshTimer();
     if (this.homeRecoveryTimer) clearInterval(this.homeRecoveryTimer);
     this.clearScheduledReconnectTimer();
     this.cameraTimer = null;
@@ -892,8 +1029,11 @@ class BotController {
     this.axeTimer = null;
     this.foodTimer = null;
     this.playerAlertTimer = null;
+    this.farmRefreshTimer = null;
+    this.farmRefreshInProgress = false;
     this.homeRecoveryTimer = null;
     this.pendingCashout = null;
+    this.pendingGameBalances.clear();
     this.resumeFarmingAfterAxe = false;
     this.tpaInProgress = false;
     this.pendingTpaSender = '';
@@ -932,7 +1072,7 @@ class BotController {
       this.stopRuntime();
       this.forceClose();
       this.clearReconnectTimer();
-      this.reconnectTimer = setTimeout(() => this.connect(), 1000);
+      this.reconnectTimer = setTimeout(() => this.connect(), this.getReconnectPreConnectDelayMs());
     });
   }
 
@@ -986,12 +1126,40 @@ class BotController {
     this.manualClose = true;
     this.setStatus(reason);
 
+    this.clearFarmRefreshTimer();
+    await this.prepareHomeBeforeDisconnect(reason);
     this.stopRuntime();
     this.forceClose();
 
     if (reason === 'Reconnecting') {
       this.clearReconnectTimer();
-      this.reconnectTimer = setTimeout(() => this.connect(), 1000);
+      this.reconnectTimer = setTimeout(() => this.connect(), this.getReconnectPreConnectDelayMs());
+    }
+  }
+
+  async prepareHomeBeforeDisconnect(reason = 'disconnect') {
+    if (this.settings.disconnect_home_enabled === false) return false;
+    if (!this.bot || this.disconnectHandled) return false;
+    const command = this.normalizedTradeHomeCommand();
+    if (!command) return false;
+
+    try {
+      this.logger.info(`Pre-disconnect home: sending ${command} before ${reason}`);
+      this.stopAttack(true);
+      this.closeCurrentWindow('before pre-disconnect home');
+      this.setStatus('Pre-Disconnect Home');
+      this.sendChat(command);
+      const waitMs = Math.max(
+        5000,
+        Number(this.settings.disconnect_home_wait_ms) ||
+          Number(this.settings.teleport_wait_ms) ||
+          6500
+      );
+      await sleep(waitMs);
+      return true;
+    } catch (error) {
+      this.logger.warn(`Pre-disconnect home failed: ${error.message || error}`);
+      return false;
     }
   }
 
@@ -1176,6 +1344,16 @@ class BotController {
 
     const stuckMs = this.getHomeRecoveryStuckMs();
     if (!this.homeRecoveryLastMovedAt || now - this.homeRecoveryLastMovedAt < stuckMs) return;
+    if (!this.canStartHomeRecovery(now)) {
+      const waitMs = Math.max(0, this.homeRecoveryNextStartAllowedAt - now);
+      this.logThrottled(
+        'home-recovery-repeat-suppressed',
+        `Home Recovery: repeated start suppressed for ${formatDuration(waitMs)} after recent recovery attempt`,
+        30000
+      );
+      this.markHomeRecoveryMovement(now);
+      return;
+    }
 
     this.beginHomeRecoveryDelay(this.homeRecoveryInactivityReason(stuckMs));
   }
@@ -1221,6 +1399,15 @@ class BotController {
   getHomeRecoveryDiscordCooldownMs() {
     const cooldown = Number(this.settings.home_recovery_discord_cooldown_ms);
     return Math.max(0, Number.isFinite(cooldown) ? cooldown : 10 * 60 * 1000);
+  }
+
+  getHomeRecoveryRepeatCooldownMs() {
+    const cooldown = Number(this.settings.home_recovery_repeat_cooldown_ms);
+    return Math.max(0, Number.isFinite(cooldown) ? cooldown : DEFAULT_HOME_RECOVERY_REPEAT_COOLDOWN_MS);
+  }
+
+  canStartHomeRecovery(now = Date.now()) {
+    return !this.homeRecoveryNextStartAllowedAt || now >= this.homeRecoveryNextStartAllowedAt;
   }
 
   getRecentFarmActivityAt(now = Date.now()) {
@@ -1271,13 +1458,19 @@ class BotController {
 
   beginHomeRecoveryDelay(reason) {
     if (!this.bot || this.disconnectHandled) return;
+    const now = Date.now();
     const delayMs = Math.max(0, Number(this.settings.home_recovery_first_home_delay_seconds) || 0) * 1000;
+    const diagnostic = this.homeRecoveryDiagnosticLine(now);
     this.homeRecoveryState = HOME_RECOVERY.delayBeforeHome;
-    this.homeRecoveryActionAt = Date.now() + delayMs;
+    this.homeRecoveryActionAt = now + delayMs;
+    this.homeRecoveryNextStartAllowedAt = Math.max(
+      this.homeRecoveryNextStartAllowedAt || 0,
+      now + this.getHomeRecoveryRepeatCooldownMs()
+    );
     this.stopAttack(true);
     this.setStatus('Home Recovery');
     this.notifyHomeRecovery(
-      `${reason}. Sending ${this.normalizedHomeCommand()} in ${Math.round(delayMs / 1000)}s.`,
+      `${reason}. Sending ${this.normalizedHomeCommand()} in ${Math.round(delayMs / 1000)}s.${diagnostic ? ` diag: ${diagnostic}` : ''}`,
       true,
       { cooldownKey: 'start', cooldownMs: this.getHomeRecoveryDiscordCooldownMs() }
     );
@@ -1494,6 +1687,10 @@ class BotController {
     return String(this.settings.home_farm_command || '/home 1').trim();
   }
 
+  normalizedTradeHomeCommand() {
+    return String(this.settings.home_trade_command || '/home 2').trim();
+  }
+
   notifyHomeRecovery(message, discord = false, options = {}) {
     const line = `Home Recovery: ${message}`;
     this.logger.warn(line);
@@ -1512,11 +1709,22 @@ class BotController {
 
   async refreshBalance() {
     const username = this.statsUsername();
-    const result = await this.donutApi.getBalance(username, {
+    let result = await this.donutApi.getBalance(username, {
       botKey: this.botConfig.username,
       displayName: this.displayName()
     });
-    
+
+    if (isTransientBalanceApiError(result)) {
+      const gameBalance = await this.getGameBalanceFallback(result);
+      if (gameBalance && gameBalance.ok) result = gameBalance;
+    }
+
+    this.applyBalanceResult(result);
+    this.balanceLabel = this.cachedBalanceLabelForTransientError(result) || result.label;
+    return result;
+  }
+
+  applyBalanceResult(result) {
     if (result.ok && Number.isFinite(result.balance)) {
       const now = Date.now();
       if (this.lastBalance === null) {
@@ -1542,13 +1750,180 @@ class BotController {
         this.profitSamples.push({ at: now, balance: result.balance });
       }
       this.lastBalance = result.balance;
+      this.lastBalanceAt = now;
       
       this.updateProfitMetrics(now);
       this.checkProfitAlert(now);
     }
-    
-    this.balanceLabel = result.label;
+  }
+
+  async getGameBalanceFallback(apiResult) {
+    return this.getGameBalance(this.statsUsername(), { apiResult });
+  }
+
+  async getGameBalance(username, options = {}) {
+    if (!this.bot || this.disconnectHandled) return null;
+    const command = this.gameBalanceCommand(username);
+    if (!command) return null;
+    const key = String(username || this.statsUsername() || '').trim().toLowerCase() || 'self';
+    if (this.pendingGameBalances.has(key)) return this.pendingGameBalances.get(key);
+
+    const waitMs = Math.max(1000, Number(this.settings.balance_command_wait_ms) || 5000);
+    const startedAt = Date.now();
+    const apiResult = options.apiResult || null;
+    const promise = new Promise((resolve) => {
+      let settled = false;
+      let timeoutId = null;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId) clearTimeout(timeoutId);
+        this.bot?.removeListener('message', listener);
+        this.bot?.removeListener('messagestr', listener);
+        resolve(result);
+      };
+      const listener = (jsonMsg) => {
+        try {
+          const rawText = normalizeMinecraftText(jsonMsg, { maxDepth: 10, maxStrings: 80 }).trim();
+          const balance = parseGameBalanceMessage(rawText, username);
+          if (!Number.isFinite(balance)) return;
+          finish({
+            ok: true,
+            code: 'GAME_BALANCE',
+            label: formatMoney(balance),
+            balance,
+            source: 'game',
+            username: String(username || ''),
+            apiCode: apiResult && apiResult.code ? apiResult.code : ''
+          });
+        } catch (error) {}
+      };
+
+      this.bot.on('message', listener);
+      this.bot.on('messagestr', listener);
+      this.sendChat(command);
+      const reason = apiResult && apiResult.code ? ` after ${apiResult.code}` : '';
+      this.logger.warn(`Requested in-game balance${reason}: ${command}`);
+      timeoutId = setTimeout(() => {
+        finish({
+          ok: false,
+          code: 'GAME_BALANCE_TIMEOUT',
+          label: 'Game balance timeout',
+          balance: null,
+          source: 'game',
+          username: String(username || ''),
+          apiCode: apiResult && apiResult.code ? apiResult.code : '',
+          elapsedMs: Date.now() - startedAt
+        });
+      }, waitMs);
+    }).finally(() => {
+      this.pendingGameBalances.delete(key);
+    });
+
+    this.pendingGameBalances.set(key, promise);
+    const result = await promise;
+    if (result.ok) {
+      this.logger.info(`In-game balance ok target=${username || 'self'} balance=${formatMoney(result.balance)} sourceApi=${result.apiCode || '-'}`);
+    } else {
+      this.logger.warn(`In-game balance failed target=${username || 'self'} code=${result.code} sourceApi=${result.apiCode || '-'}`);
+    }
     return result;
+  }
+
+  gameBalanceCommand(username) {
+    const base = String(this.settings.balance_command || '/bal').trim();
+    if (!base) return '';
+    const target = String(username || '').trim();
+    if (!target || this.isOwnBalanceName(target)) return base;
+    if (base.includes('{username}')) return base.replace(/\{username\}/g, target);
+    return `${base} ${target}`;
+  }
+
+  isOwnBalanceName(username) {
+    const target = String(username || '').trim().toLowerCase();
+    if (!target) return true;
+    const ownNames = [
+      this.statsUsername(),
+      this.displayName(),
+      this.realUsername,
+      this.bot && this.bot.username,
+      this.botConfig.nickname,
+      this.botConfig.stats_username,
+      this.botConfig.username
+    ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    return ownNames.includes(target);
+  }
+
+  balanceCacheMaxAgeMs() {
+    const configuredMaxAge = Number(this.settings.cashout_balance_cache_max_age_ms);
+    return Number.isFinite(configuredMaxAge)
+      ? Math.max(0, configuredMaxAge)
+      : DEFAULT_CASHOUT_BALANCE_CACHE_MAX_AGE_MS;
+  }
+
+  cachedBalanceLabelForTransientError(result) {
+    if (!isTransientBalanceApiError(result)) return '';
+    const cachedAt = Number(this.lastBalanceAt) || 0;
+    const ageMs = cachedAt ? Date.now() - cachedAt : Infinity;
+    if (
+      Number.isFinite(this.lastBalance) &&
+      this.lastBalance >= 0 &&
+      cachedAt > 0 &&
+      ageMs <= this.balanceCacheMaxAgeMs()
+    ) {
+      return formatMoney(this.lastBalance);
+    }
+    return '';
+  }
+
+  cashoutBalanceFromResult(result) {
+    if (result && result.ok && Number.isFinite(result.balance) && result.balance > 0) {
+      return {
+        balance: result.balance,
+        source: 'api',
+        ageMs: 0,
+        code: result.code || 'OK'
+      };
+    }
+    if (!isTransientBalanceApiError(result)) return null;
+
+    const cachedAt = Number(this.lastBalanceAt) || 0;
+    const ageMs = cachedAt ? Date.now() - cachedAt : Infinity;
+    if (
+      Number.isFinite(this.lastBalance) &&
+      this.lastBalance > 0 &&
+      cachedAt > 0 &&
+      ageMs <= this.balanceCacheMaxAgeMs()
+    ) {
+      return {
+        balance: this.lastBalance,
+        source: 'cache',
+        ageMs,
+        code: result && result.code ? result.code : ''
+      };
+    }
+
+    return null;
+  }
+
+  recordCashoutAcceptedLocally(beforeBalance, amount) {
+    const before = Number(beforeBalance);
+    const paid = Number(amount);
+    if (!Number.isFinite(before) || !Number.isFinite(paid) || paid <= 0) return;
+
+    const now = Date.now();
+    const after = Math.max(0, before - paid);
+    this.lastBalance = after;
+    this.lastBalanceAt = now;
+    this.balanceLabel = formatMoney(after);
+    this.sessionStartTime = now;
+    this.sessionEarned = 0;
+    this.currentPerHour = 0;
+    this.shortPerHour = 0;
+    this.profitReady = false;
+    this.profitSamples = [{ at: now, balance: after }];
+    this.resetProfitAlertState();
+    this.updateProfitMetrics(now);
   }
 
   updateProfitMetrics(now = Date.now()) {
@@ -1693,8 +2068,16 @@ class BotController {
       this.logger.warn('Cashout skipped: another cashout is already in progress');
       return false;
     }
-    const before = await this.refreshBalance();
-    if (!before.ok || !Number.isFinite(before.balance) || before.balance <= 0) return false;
+    const balanceResult = await this.refreshBalance();
+    const before = this.cashoutBalanceFromResult(balanceResult);
+    if (!before) {
+      const reason = balanceResult && balanceResult.code
+        ? `balance unavailable (${balanceResult.code}) and no fresh cached balance`
+        : 'balance unavailable and no fresh cached balance';
+      this.logger.warn(`Cashout skipped: ${reason}`);
+      this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` cashout skipped. Reason: \`${discordInline(reason, 180)}\``);
+      return false;
+    }
     const cashoutNickname = String(this.config.cashout_nickname || '').trim();
     if (!cashoutNickname) {
       this.logger.warn('cashout_nickname is not configured');
@@ -1703,6 +2086,12 @@ class BotController {
     
     const amount = Math.floor(before.balance);
     if (amount <= 0) return false;
+    if (before.source === 'cache') {
+      const reason = before.code ? `API ${before.code}` : 'API unavailable';
+      const age = formatDuration(before.ageMs);
+      this.logger.warn(`Cashout using cached balance because ${reason}; cachedAge=${age} amount=${amount}`);
+      this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` ${reason}; using cached balance from \`${age}\` ago for cashout.`);
+    }
 
     const payment = {
       success: false,
@@ -1735,7 +2124,7 @@ class BotController {
       this.setStatus('Cashout');
       this.closeCurrentWindow('before cashout');
       this.sendChat(`/pay ${cashoutNickname} ${amount}`);
-      this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}${isRecoveryRetry ? ' (recovery retry)' : ''}`);
+      this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}${isRecoveryRetry ? ' (recovery retry)' : ''} balanceSource=${before.source}`);
 
       const replyWaitMs = Math.max(1000, Number(this.settings.cashout_reply_wait_ms) || 5000);
       await sleep(replyWaitMs);
@@ -1764,6 +2153,7 @@ class BotController {
 
       if (payment.success) {
         this.logger.info(`Cashout accepted by server amount=${amount} target=${cashoutNickname}${payment.message ? ` reply=${payment.message.slice(0, 160)}` : ''}`);
+        this.recordCashoutAcceptedLocally(before.balance, amount);
         return true;
       }
 
@@ -2170,7 +2560,8 @@ class BotController {
     if (!axeReady || !this.attackLoopActive || !this.bot || this.disconnectHandled) return;
 
     const reach = Math.max(1, Number(this.settings.farm_reach_blocks) || 4.5);
-    const target = this.selectAttackTarget(reach);
+    await this.ensureFarmCameraLocked();
+    const target = await this.selectAttackTarget(reach);
     if (!target) {
       this.logNoTargetDiagnostics(reach);
       return;
@@ -2185,9 +2576,8 @@ class BotController {
       // Обязательно машем рукой для античита
       if (typeof this.bot.swingArm === 'function') this.bot.swingArm('right');
 
-      // bot.dig(блок, смотретьЛиНаБлок, типРейкаста) - строго как в minimal_bot.js (forceLook: true)
       this.recordFarmTarget(target);
-      await this.bot.dig(target, true, 'raycast');
+      await this.bot.dig(target, false, 'raycast');
       this.markFarmActivity();
       this.recordFarmTarget(target);
       this.logTargetBlock(target, target);
@@ -2199,15 +2589,62 @@ class BotController {
     }
   }
 
-  selectAttackTarget(reach) {
+  async selectAttackTarget(reach) {
+    const cursorTarget = this.bot ? this.bot.blockAtCursor(reach) : null;
+    if (this.isAllowedAttackBlock(cursorTarget)) return cursorTarget;
+
+    const fallbackTarget = await this.findCursorFallbackTarget(reach);
+    if (fallbackTarget) return fallbackTarget;
+
     const targets = this.findAttackTargets(reach);
     if (!targets.length) return null;
-    if (this.settings.target_cycle_enabled === false) return targets[0];
+    if (this.settings.target_cycle_enabled === false) {
+      this.logThrottled('farm-scan-fallback-target', `Cursor target missing; using scan fallback ${this.describeBlock(targets[0])}`, 10000);
+      return targets[0];
+    }
 
     this.attackTargetCycleIndex %= targets.length;
     const target = targets[this.attackTargetCycleIndex];
     this.attackTargetCycleIndex = (this.attackTargetCycleIndex + 1) % targets.length;
+    this.logThrottled('farm-scan-fallback-target', `Cursor target missing; using scan fallback ${this.describeBlock(target)}`, 10000);
     return target;
+  }
+
+  async findCursorFallbackTarget(reach) {
+    if (this.settings.cursor_fallback_enabled === false || !this.bot || !this.bot.entity) return null;
+
+    const baseYaw = yawForCardinal(this.config.server.target_cardinal_direction || 'SOUTH');
+    const configuredPitch = Number(this.config.server.pitch_degrees);
+    const basePitch = ((Number.isFinite(configuredPitch) ? configuredPitch : -89) * Math.PI) / 180;
+    const yawOffsets = Array.isArray(this.settings.cursor_fallback_yaw_degrees)
+      ? this.settings.cursor_fallback_yaw_degrees
+      : [0];
+    const pitchOffsets = Array.isArray(this.settings.cursor_fallback_pitch_degrees)
+      ? this.settings.cursor_fallback_pitch_degrees
+      : [0];
+
+    for (const pitchOffset of pitchOffsets) {
+      for (const yawOffset of yawOffsets) {
+        const yaw = baseYaw + (Number(yawOffset) || 0) * Math.PI / 180;
+        const pitch = basePitch + (Number(pitchOffset) || 0) * Math.PI / 180;
+        try {
+          await this.bot.look(yaw, pitch, true);
+          const block = this.bot.blockAtCursor(reach);
+          if (this.isAllowedAttackBlock(block)) {
+            this.logThrottled(
+              'farm-cursor-fallback-target',
+              `Cursor fallback target ${this.describeBlock(block)} yawOffset=${yawOffset} pitchOffset=${pitchOffset}`,
+              10000
+            );
+            return block;
+          }
+        } catch (error) {
+          this.logThrottled('farm-cursor-fallback-failed', `Cursor fallback look failed: ${error.message || error}`, 10000);
+        }
+      }
+    }
+
+    return null;
   }
 
   findAttackTargets(reach) {
@@ -2395,6 +2832,50 @@ class BotController {
       `No target block found reach=${reach} yaw=${yaw} pitch=${pitch} pos=${pos} cursor=${this.describeBlock(cursorBlock)} held=${this.describeItem(this.bot && this.bot.heldItem)} targetDigging=${this.describeBlock(this.bot && this.bot.targetDigging)}`,
       15000
     );
+  }
+
+  homeRecoveryDiagnosticLine(now = Date.now()) {
+    try {
+      const entity = this.bot && this.bot.entity;
+      const reach = Math.max(1, Number(this.settings.farm_reach_blocks) || 4.5);
+      const targets = this.findAttackTargets(reach);
+      const cursorBlock = this.bot ? this.bot.blockAtCursor(reach) : null;
+      const held = this.bot && this.bot.heldItem;
+      const pos = entity && entity.position
+        ? `${entity.position.x.toFixed(2)},${entity.position.y.toFixed(2)},${entity.position.z.toFixed(2)}`
+        : '-';
+      const yaw = entity ? radiansToDegrees(entity.yaw).toFixed(1) : '-';
+      const pitch = entity ? radiansToDegrees(entity.pitch).toFixed(1) : '-';
+      const lastFarmAgo = this.lastFarmActivityAt ? formatDuration(now - this.lastFarmActivityAt) : 'never';
+      const lastMoveAgo = this.homeRecoveryLastMovedAt ? formatDuration(now - this.homeRecoveryLastMovedAt) : 'never';
+      const lastTarget = this.lastFarmTarget && this.lastFarmTarget.position
+        ? `${this.lastFarmTarget.name}@${this.lastFarmTarget.position.x},${this.lastFarmTarget.position.y},${this.lastFarmTarget.position.z}${this.lastFarmTarget.at ? ` ${formatDuration(now - this.lastFarmTarget.at)} ago` : ''}`
+        : 'none';
+      const nearestTargets = targets
+        .slice(0, 3)
+        .map((block) => this.describeBlock(block))
+        .join('|') || 'none';
+
+      return discordInline([
+        `status=${this.status}`,
+        `attack=${this.attackLoopActive ? 'on' : 'off'}`,
+        `digging=${this.isDigging() ? this.describeBlock(this.getDigTarget()) : 'no'}`,
+        `axe=${this.axeLabel || '-'}`,
+        `held=${this.describeItem(held)}`,
+        `pos=${pos}`,
+        `yaw=${yaw}`,
+        `pitch=${pitch}`,
+        `reach=${reach}`,
+        `targets=${targets.length}`,
+        `nearest=${nearestTargets}`,
+        `cursor=${this.describeBlock(cursorBlock)}`,
+        `lastFarm=${lastFarmAgo}`,
+        `lastMove=${lastMoveAgo}`,
+        `lastTarget=${lastTarget}`
+      ].join(' | '), 900);
+    } catch (error) {
+      return `diagnostic failed: ${discordInline(error.message || error, 160)}`;
+    }
   }
 
   logTargetBlock(block, target) {
@@ -2931,6 +3412,55 @@ function classifyCashoutReply(message, targetNickname, amount = 0) {
   }
 
   return null;
+}
+
+function isTransientBalanceApiError(result) {
+  if (!result || result.ok) return false;
+  const code = String(result.code || '');
+  return code === 'API_ERROR' || code === 'GAME_BALANCE_TIMEOUT' || /^HTTP_5\d\d$/.test(code);
+}
+
+function parseGameBalanceMessage(message, username = '') {
+  const text = normalizeMinecraftText(message).replace(/\s+/g, ' ').trim();
+  if (!text || text.startsWith('<')) return NaN;
+
+  const target = String(username || '').trim();
+  const patterns = [];
+  if (target) {
+    patterns.push(new RegExp(`\\b${escapeRegExp(target)}\\s+has\\s+\\$?\\s*([\\d,.]+(?:[kmbt])?)\\b`, 'i'));
+  }
+  patterns.push(
+    /\byou\s+have\s+\$?\s*([\d,.]+(?:[kmbt])?)\b/i,
+    /\bbalance\s*[:>»]?\s*\$?\s*([\d,.]+(?:[kmbt])?)\b/i,
+    /\bbal\s*[:>»]?\s*\$?\s*([\d,.]+(?:[kmbt])?)\b/i,
+    /\$\s*([\d,.]+(?:[kmbt])?)\b/i
+  );
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const value = parseCompactBalanceNumber(match[1]);
+    if (Number.isFinite(value)) return value;
+  }
+  return NaN;
+}
+
+function parseCompactBalanceNumber(value) {
+  const text = String(value || '').trim().toLowerCase();
+  const match = text.match(/^([\d,.]+)\s*([kmbt])?$/i);
+  if (!match) return NaN;
+  const number = Number(match[1].replace(/,/g, ''));
+  if (!Number.isFinite(number)) return NaN;
+  const suffix = match[2] || '';
+  const multiplier = suffix === 'k'
+    ? 1_000
+    : suffix === 'm'
+      ? 1_000_000
+      : suffix === 'b'
+        ? 1_000_000_000
+        : suffix === 't'
+          ? 1_000_000_000_000
+          : 1;
+  return number * multiplier;
 }
 
 function escapeRegExp(value) {

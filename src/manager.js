@@ -7,13 +7,15 @@ const { BotController } = require('./botController');
 const { Dashboard } = require('./dashboard');
 const { DonutApi } = require('./donutApi');
 const { getProxyLabel } = require('./proxy');
-const { formatCompactMoney, writeJsonFile } = require('./utils');
+const { formatCompactMoney, formatDuration, writeJsonFile } = require('./utils');
 
 class Manager {
   constructor(config, logger) {
     this.config = config;
     this.logger = logger;
-    this.donutApi = new DonutApi(config, logger.child('donut-api'));
+    this.donutApi = new DonutApi(config, logger.child('donut-api'), {
+      onHealthEvent: (event) => this.handleDonutApiHealthEvent(event)
+    });
     this.dashboard = new Dashboard(config, this, logger.child('dashboard'));
     this.controllers = [];
     this.commandCooldown = new Map();
@@ -62,6 +64,23 @@ class Manager {
     this.profitAlertQueue = [];
     await Promise.allSettled(this.controllers.map((controller) => controller.shutdown()));
     await this.dashboard.shutdown();
+  }
+
+  handleDonutApiHealthEvent(event) {
+    const message = formatDonutApiHealthEvent(event);
+    if (!message) return;
+
+    if (event.type === 'recovered') {
+      this.logger.info(`Donut API recovered after ${formatDuration(event.durationMs)} failures=${event.failureCount}`);
+    } else {
+      const failure = event.lastFailure || {};
+      this.logger.warn(`Donut API ${event.type === 'still_down' ? 'still down' : 'down'} code=${failure.code || '-'} failures=${event.failureCount}`);
+    }
+
+    const sent = this.dashboard?.sendLog(message);
+    if (sent && typeof sent.catch === 'function') {
+      sent.catch((error) => this.logger.warn(`Failed to send Donut API health log: ${error.message || error}`));
+    }
   }
 
   queueProfitAlert(controller, alert) {
@@ -177,6 +196,21 @@ class Manager {
 
   async refreshAllBalances() {
     await Promise.allSettled(this.controllers.map((controller) => controller.refreshBalance()));
+  }
+
+  async getGameBalanceForTarget(username) {
+    const target = String(username || '').trim();
+    if (!target) return null;
+    const controller = this.controllers.find((item) => (
+      item &&
+      item.bot &&
+      !item.disconnectHandled &&
+      !item.userPaused &&
+      !item.pausedAuto &&
+      typeof item.getGameBalance === 'function'
+    ));
+    if (!controller) return null;
+    return controller.getGameBalance(target, { source: 'cashout-target' });
   }
 
   async cashoutAll() {
@@ -432,6 +466,101 @@ class Manager {
 
 function safeLogName(value) {
   return String(value || 'unknown').replace(/[^a-z0-9_.@-]+/gi, '_').slice(0, 80) || 'unknown';
+}
+
+function formatDonutApiHealthEvent(event) {
+  if (!event || !event.type) return '';
+  const failure = event.lastFailure || event.firstFailure || {};
+  const lines = [];
+
+  if (event.type === 'recovered') {
+    lines.push('Donut API RECOVERED: balance checks are working again.');
+  } else if (event.type === 'still_down') {
+    lines.push('Donut API STILL DOWN: balance checks are still failing.');
+  } else {
+    lines.push('Donut API DOWN: balance checks started failing.');
+  }
+
+  if (event.downAt) {
+    lines.push(`Started: ${discordTimestamp(event.downAt)} (${discordRelativeTimestamp(event.downAt)})`);
+  }
+  if (event.type === 'recovered' && event.at) {
+    lines.push(`Recovered: ${discordTimestamp(event.at)} (${discordRelativeTimestamp(event.at)})`);
+  }
+  if (Number.isFinite(Number(event.durationMs)) && Number(event.durationMs) > 0) {
+    lines.push(`Duration: ${formatDuration(event.durationMs)}`);
+  }
+  if (event.lastOkAt) {
+    lines.push(`Previous OK: ${discordTimestamp(event.lastOkAt)} (${discordRelativeTimestamp(event.lastOkAt)})`);
+  } else if (event.type !== 'recovered') {
+    lines.push('Previous OK: none since this process started.');
+  }
+
+  lines.push(`Failures: ${Math.max(0, Number(event.failureCount) || 0)}`);
+  if (event.firstFailure && event.firstFailure !== failure) {
+    lines.push(`First failure: ${formatDonutApiFailure(event.firstFailure)}`);
+  }
+  lines.push(`Last failure: ${formatDonutApiFailure(failure)}`);
+
+  if (event.recovery) {
+    lines.push(`Recovery check: ${formatDonutApiRequest(event.recovery)}`);
+  }
+
+  if (event.type !== 'recovered') {
+    lines.push('Effect: dashboard keeps cached balances when possible; cashout can use a fresh cached balance.');
+  }
+
+  return lines.join('\n').slice(0, 1900);
+}
+
+function formatDonutApiFailure(failure) {
+  if (!failure) return '`unknown`';
+  const parts = [
+    `code=${failure.code || '-'}`,
+    failure.status ? `http=${failure.status}${failure.statusText ? ` ${failure.statusText}` : ''}` : '',
+    `target=${formatDonutApiTarget(failure)}`,
+    failure.url ? `url=${failure.url}` : '',
+    failure.message ? `detail=${failure.message}` : ''
+  ].filter(Boolean);
+  return discordCode(parts.join(' | '), 500);
+}
+
+function formatDonutApiRequest(request) {
+  const parts = [
+    `code=${request.code || 'OK'}`,
+    request.status ? `http=${request.status}` : '',
+    `target=${formatDonutApiTarget(request)}`,
+    request.url ? `url=${request.url}` : ''
+  ].filter(Boolean);
+  return discordCode(parts.join(' | '), 500);
+}
+
+function formatDonutApiTarget(value) {
+  const displayName = String(value && value.displayName || '').trim();
+  const username = String(value && value.username || '').trim();
+  if (displayName && username && displayName !== username) return `${displayName} (${username})`;
+  return displayName || username || 'unknown';
+}
+
+function discordTimestamp(ms) {
+  return `<t:${Math.floor(Number(ms) / 1000)}:F>`;
+}
+
+function discordRelativeTimestamp(ms) {
+  return `<t:${Math.floor(Number(ms) / 1000)}:R>`;
+}
+
+function discordCode(value, maxLength = 240) {
+  return `\`${discordInline(value, maxLength)}\``;
+}
+
+function discordInline(value, maxLength = 240) {
+  const text = String(value || '')
+    .replace(/`/g, 'ʼ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 module.exports = {
