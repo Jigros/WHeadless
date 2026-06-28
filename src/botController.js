@@ -550,7 +550,6 @@ class BotController {
     await this.returnHomeAfterSpawn();
     if (bot !== this.bot || this.disconnectHandled) return;
 
-    await this.lockFarmCamera();
     this.startBalancePolling();
     this.startAxePolling();
     this.startHomeRecoveryPolling();
@@ -609,28 +608,11 @@ class BotController {
   }
 
   async lockFarmCamera() {
-    if (!this.bot || !this.bot.entity) return;
-    try {
-      const yaw = yawForCardinal(this.config.server.target_cardinal_direction || 'SOUTH');
-      const configuredPitch = Number(this.config.server.pitch_degrees);
-      const pitchDegrees = Number.isFinite(configuredPitch) ? configuredPitch : -89;
-      const pitch = (pitchDegrees * Math.PI) / 180;
-      await this.bot.look(yaw, pitch, true);
-      this.logger.info(`Farm camera locked yaw=${radiansToDegrees(yaw).toFixed(1)} pitch=${radiansToDegrees(pitch).toFixed(1)}`);
-    } catch (error) {
-      this.logger.warn(`Farm camera lock failed: ${error.message || error}`);
-    }
+    return false;
   }
 
   async ensureFarmCameraLocked() {
-    if (!this.bot || !this.bot.entity) return;
-    const targetYaw = yawForCardinal(this.config.server.target_cardinal_direction || 'SOUTH');
-    const configuredPitch = Number(this.config.server.pitch_degrees);
-    const targetPitch = ((Number.isFinite(configuredPitch) ? configuredPitch : -89) * Math.PI) / 180;
-    const yawDiff = Math.abs(normalizeRadians((this.bot.entity.yaw || 0) - targetYaw));
-    const pitchDiff = Math.abs((this.bot.entity.pitch || 0) - targetPitch);
-    if (yawDiff < 0.03 && pitchDiff < 0.03) return;
-    await this.lockFarmCamera();
+    return false;
   }
 
   logThrottled(key, message, intervalMs) {
@@ -1058,7 +1040,6 @@ class BotController {
       await sleep(Math.max(1000, Number(this.settings.farm_refresh_home1_wait_ms) || Number(this.settings.teleport_wait_ms) || 6500));
       if (!this.bot || this.disconnectHandled || this.userPaused) return false;
 
-      await this.lockFarmCamera();
       this.markHomeRecoveryMovement();
       if (wasFarming || this.settings.farming_enabled !== false) {
         await this.startFarming();
@@ -1260,7 +1241,6 @@ class BotController {
     if (!this.resumeFarmingAfterAxe || !this.canResumeFarmingAfterAxe()) return true;
 
     this.resumeFarmingAfterAxe = false;
-    await this.lockFarmCamera().catch((error) => this.logger.warn(`Axe recovery camera lock failed: ${error.message || error}`));
     return this.startFarming();
   }
 
@@ -1725,7 +1705,6 @@ class BotController {
     this.setStatus('Ready');
     setTimeout(() => {
       if (!this.bot || this.disconnectHandled || this.tpaInProgress) return;
-      this.lockFarmCamera().catch((error) => this.logger.warn(`Home recovery camera lock failed: ${error.message || error}`));
       this.startFarming().catch((error) => this.logger.warn(`Home recovery restart failed: ${error.message || error}`));
     }, source === 'server-return' ? 1000 : 1500);
   }
