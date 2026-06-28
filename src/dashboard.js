@@ -279,7 +279,7 @@ class Dashboard {
 
   botPanelText(index, bot, notice = '') {
     const controller = this.manager.controllers.find((ctrl) => ctrl.botConfig.username === bot.username);
-    const status = controller ? controller.status : (bot.enabled === false ? 'Configured / OFF' : 'No controller');
+    const status = controller ? controller.status : (bot.ban_locked ? 'Banned / OFF' : (bot.enabled === false ? 'Configured / OFF' : 'No controller'));
     const nextReconnectAt = controller && controller.nextScheduledReconnectAt
       ? `<t:${Math.floor(controller.nextScheduledReconnectAt / 1000)}:R>`
       : '-';
@@ -410,7 +410,7 @@ class Dashboard {
     }
 
     const controller = this.manager.controllers.find((ctrl) => ctrl.botConfig.username === bot.username);
-    const status = controller ? controller.status : (bot.enabled === false ? 'Configured / OFF' : 'No controller');
+    const status = controller ? controller.status : (bot.ban_locked ? 'Banned / OFF' : (bot.enabled === false ? 'Configured / OFF' : 'No controller'));
     const chatEntries = controller ? controller.getChatLog(25) : this.readMinecraftChatLog(bot.username, 25);
     const lines = chatEntries.map((line) => this.chatLineText(line));
     const body = lines.length ? lines.join('\n') : '_No chat captured yet._';

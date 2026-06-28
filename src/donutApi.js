@@ -3,7 +3,9 @@
 const { findBalanceField, formatMoney, getByPath, safeStringify } = require('./utils');
 
 const HTTP_FAILURE_LOG_COOLDOWN_MS = 15 * 60 * 1000;
-const API_HEALTH_REPEAT_LOG_MS = 15 * 60 * 1000;
+const DEFAULT_API_HEALTH_REPEAT_LOG_MS = 30 * 60 * 1000;
+const DEFAULT_API_HEALTH_NOTIFY_MIN_FAILURES = 5;
+const DEFAULT_API_HEALTH_NOTIFY_MIN_DOWN_MS = 2 * 60 * 1000;
 const TRANSIENT_HTTP_STATUS_MIN = 500;
 
 class DonutApi {
@@ -18,10 +20,50 @@ class DonutApi {
       downAt: 0,
       lastOkAt: 0,
       lastNotifiedAt: 0,
+      notifiedDown: false,
       failureCount: 0,
       firstFailure: null,
       lastFailure: null
     };
+  }
+
+  healthNotifyMinFailures() {
+    const value = Number(this.config.health_notify_min_failures);
+    return Math.max(1, Number.isFinite(value) ? value : DEFAULT_API_HEALTH_NOTIFY_MIN_FAILURES);
+  }
+
+  healthNotifyMinDownMs() {
+    const value = Number(this.config.health_notify_min_down_ms);
+    return Math.max(0, Number.isFinite(value) ? value : DEFAULT_API_HEALTH_NOTIFY_MIN_DOWN_MS);
+  }
+
+  healthRepeatLogMs() {
+    const value = Number(this.config.health_repeat_log_ms);
+    return Math.max(60 * 1000, Number.isFinite(value) ? value : DEFAULT_API_HEALTH_REPEAT_LOG_MS);
+  }
+
+  shouldNotifyHealthDown(now = Date.now()) {
+    if (this.health.notifiedDown) return false;
+    const durationMs = this.health.downAt ? now - this.health.downAt : 0;
+    return (
+      this.health.failureCount >= this.healthNotifyMinFailures() &&
+      durationMs >= this.healthNotifyMinDownMs()
+    );
+  }
+
+  emitHealthDown(type, now = Date.now()) {
+    this.health.notifiedDown = true;
+    this.health.lastNotifiedAt = now;
+    this.emitHealthEvent({
+      type,
+      at: now,
+      downAt: this.health.downAt,
+      lastOkAt: this.health.lastOkAt,
+      durationMs: Math.max(0, now - this.health.downAt),
+      failureCount: this.health.failureCount,
+      firstFailure: this.health.firstFailure,
+      lastFailure: this.health.lastFailure
+    });
   }
 
   hasApiKey() {
@@ -75,37 +117,24 @@ class DonutApi {
     if (!this.health.down) {
       this.health.down = true;
       this.health.downAt = now;
-      this.health.lastNotifiedAt = now;
+      this.health.lastNotifiedAt = 0;
+      this.health.notifiedDown = false;
       this.health.failureCount = 1;
       this.health.firstFailure = failure;
       this.health.lastFailure = failure;
-      this.emitHealthEvent({
-        type: 'down',
-        at: now,
-        downAt: now,
-        lastOkAt: this.health.lastOkAt,
-        durationMs: 0,
-        failureCount: this.health.failureCount,
-        firstFailure: this.health.firstFailure,
-        lastFailure: this.health.lastFailure
-      });
+      if (this.shouldNotifyHealthDown(now)) this.emitHealthDown('down', now);
       return;
     }
 
     this.health.failureCount += 1;
     this.health.lastFailure = failure;
-    if (now - this.health.lastNotifiedAt >= API_HEALTH_REPEAT_LOG_MS) {
-      this.health.lastNotifiedAt = now;
-      this.emitHealthEvent({
-        type: 'still_down',
-        at: now,
-        downAt: this.health.downAt,
-        lastOkAt: this.health.lastOkAt,
-        durationMs: now - this.health.downAt,
-        failureCount: this.health.failureCount,
-        firstFailure: this.health.firstFailure,
-        lastFailure: this.health.lastFailure
-      });
+    if (!this.health.notifiedDown) {
+      if (this.shouldNotifyHealthDown(now)) this.emitHealthDown('down', now);
+      return;
+    }
+
+    if (now - this.health.lastNotifiedAt >= this.healthRepeatLogMs()) {
+      this.emitHealthDown('still_down', now);
     }
   }
 
@@ -114,6 +143,7 @@ class DonutApi {
     const previousOkAt = this.health.lastOkAt;
     this.health.lastOkAt = now;
     if (!this.health.down) return;
+    const shouldEmitRecovered = this.health.notifiedDown;
 
     const event = {
       type: 'recovered',
@@ -137,10 +167,11 @@ class DonutApi {
     this.health.down = false;
     this.health.downAt = 0;
     this.health.lastNotifiedAt = 0;
+    this.health.notifiedDown = false;
     this.health.failureCount = 0;
     this.health.firstFailure = null;
     this.health.lastFailure = null;
-    this.emitHealthEvent(event);
+    if (shouldEmitRecovered) this.emitHealthEvent(event);
   }
 
   async getBalance(username, options = {}) {

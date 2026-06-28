@@ -39,7 +39,10 @@ const DEFAULT_CONFIG = {
   donut_api: {
     base_url: 'https://api.donutsmp.net/v1/stats',
     api_key: '',
-    balance_json_path: ''
+    balance_json_path: '',
+    health_notify_min_failures: 5,
+    health_notify_min_down_ms: 120000,
+    health_repeat_log_ms: 1800000
   },
   cashout_nickname: '',
   whitelist: [],

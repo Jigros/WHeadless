@@ -29,7 +29,7 @@ class Manager {
     this.started = true;
 
     this.controllers = this.config.bots
-      .filter((botConfig) => botConfig.enabled !== false)
+      .filter((botConfig) => botConfig.enabled !== false && botConfig.ban_locked !== true)
       .map((botConfig, index) => (
         new BotController({
           botConfig,
@@ -134,7 +134,7 @@ class Manager {
       if (controller) return controller.snapshot();
       return {
         name: botConfig.nickname || botConfig.username,
-        status: botConfig.enabled === false ? 'Configured / OFF' : 'Offline',
+        status: botConfig.ban_locked ? 'Banned / OFF' : (botConfig.enabled === false ? 'Configured / OFF' : 'Offline'),
         balance: '-',
         axe: '-',
         proxy: getProxyLabel(botConfig.effective_proxy || botConfig.proxy || null),
@@ -143,7 +143,7 @@ class Manager {
         hunger: '-/20',
         nextReconnectAt: 0,
         online: false,
-        paused: botConfig.enabled === false
+        paused: botConfig.enabled === false || botConfig.ban_locked === true
       };
     });
   }
@@ -311,6 +311,9 @@ class Manager {
     }
 
     if (actionText === 'ON') {
+      if (index > -1 && this.config.bots[index].ban_locked) {
+        return `Bot ${username} is ban-locked and cannot be turned ON. Ban ID: ${this.config.bots[index].ban_id || 'unknown'}`;
+      }
       if (index > -1) {
         this.config.bots[index].enabled = true;
         writeJsonFile('config.json', this.config);
@@ -348,7 +351,11 @@ class Manager {
     }
 
     if (Object.prototype.hasOwnProperty.call(data, 'enabled')) {
-      botConfig.enabled = Boolean(data.enabled);
+      if (botConfig.ban_locked && Boolean(data.enabled)) {
+        botConfig.enabled = false;
+      } else {
+        botConfig.enabled = Boolean(data.enabled);
+      }
     }
     if (Object.prototype.hasOwnProperty.call(data, 'announce_login_on_next_start')) {
       botConfig.announce_login_on_next_start = Boolean(data.announce_login_on_next_start);

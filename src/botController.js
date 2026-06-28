@@ -654,7 +654,13 @@ class BotController {
     
     let isGhostSession = kind === 'kicked' && lowerReason.includes('already online');
     let isSecurity = kind === 'kicked' && classification.category === 'Server Security';
+    let isBan = kind === 'kicked' && classification.category === 'Server Ban';
     let isTicket = kind === 'kicked' && (lowerReason.includes('make a ticket') || lowerReason.includes("don't know what happened"));
+
+    if (isBan) {
+      this.handleServerBan(reasonText, classification);
+      return;
+    }
 
     let fastRetry = false;
     if ((kind === 'kicked' || kind === 'error') && !suppressExpectedRestartDisconnect && !isGhostSession && !isSecurity && !isTicket) {
@@ -746,6 +752,57 @@ class BotController {
     this.manager.dashboard?.sendLog(`⏳ \`${this.displayName()}\` ${msg}`);
   }
 
+  handleServerBan(reasonText, classification) {
+    this.clearReconnectTimer();
+    this.pausedAuto = true;
+    this.userPaused = true;
+    this.botConfig.enabled = false;
+    this.botConfig.ban_locked = true;
+    this.botConfig.disabled_reason = 'Server ban detected';
+    this.botConfig.disabled_at = new Date().toISOString();
+
+    const ban = parseServerBan(reasonText);
+    if (ban.type) this.botConfig.ban_type = ban.type;
+    if (ban.timeLeft) this.botConfig.ban_time_left = ban.timeLeft;
+    if (ban.id) this.botConfig.ban_id = ban.id;
+
+    try {
+      const botConfig = (this.config.bots || []).find((bot) => bot.username === this.botConfig.username);
+      if (botConfig) {
+        botConfig.enabled = false;
+        botConfig.ban_locked = true;
+        botConfig.disabled_reason = this.botConfig.disabled_reason;
+        botConfig.disabled_at = this.botConfig.disabled_at;
+        if (ban.type) botConfig.ban_type = ban.type;
+        if (ban.timeLeft) botConfig.ban_time_left = ban.timeLeft;
+        if (ban.id) botConfig.ban_id = ban.id;
+      }
+      const { writeJsonFile } = require('./utils');
+      writeJsonFile('config.json', this.config);
+    } catch (error) {
+      this.logger.warn(`Failed to persist ban lock: ${error.message || error}`);
+    }
+
+    this.setStatus('Banned / OFF');
+    const fullReason = this.cleanDisconnectMessage(reasonText, 5000);
+    const discordReason = this.cleanDisconnectMessage(reasonText, 1200);
+    const detail = [
+      `🚫 \`${this.displayName()}\` server ban detected. Bot was turned OFF and ban-locked.`,
+      `Account: \`${discordInline(this.botConfig.username, 120)}\``,
+      this.realUsername ? `Minecraft: \`${discordInline(this.realUsername, 32)}\`` : '',
+      `Proxy: \`${discordInline(getProxyLabel(this.proxy), 120)}\``,
+      ban.type ? `Ban type: \`${discordInline(ban.type, 40)}\`` : '',
+      ban.timeLeft ? `Time left: \`${discordInline(ban.timeLeft, 80)}\`` : '',
+      ban.id ? `Ban ID: \`${discordInline(ban.id, 40)}\`` : '',
+      `Kind: **kicked** Category: **${classification.category}**`,
+      `Reason:\n\`\`\`\n${discordReason}\n\`\`\``,
+      this.disconnectDiagnosticSuffix('kicked', reasonText, classification)
+    ].filter(Boolean).join('\n');
+
+    this.logger.error(`Server ban locked bot=${this.displayName()} account=${this.botConfig.username} proxy=${getProxyLabel(this.proxy)} banType=${ban.type || '-'} timeLeft=${ban.timeLeft || '-'} banId=${ban.id || '-'} reason=${fullReason.replace(/\n/g, ' | ')}`);
+    this.manager.dashboard?.sendLog(detail);
+  }
+
   logProtocolDiagnostics(kind, reasonText) {
     const classification = this.classifyDisconnect(kind, reasonText);
     this.logger.warn(`Disconnected bot=${this.displayName()} kind=${kind} category=${classification.category} phase=${this.phase} reason=${classification.message}`);
@@ -804,6 +861,9 @@ class BotController {
     }
     if (isServerSecurityKick(kind, lower)) {
       return { category: 'Server Security', message: 'DonutSMP blocked this login as a possible unauthorized login. Confirm it with the button in this account Discord DMs, then turn the bot ON again.' };
+    }
+    if (isServerBanKick(kind, lower)) {
+      return { category: 'Server Ban', message: this.cleanDisconnectMessage(text, 3000) };
     }
     if (lower.includes('already online')) {
       return { category: 'Session', message: 'This Minecraft account is already online. Possible ghost session.' };
@@ -975,9 +1035,12 @@ class BotController {
     const delay = Number.isFinite(Number(delayMs)) ? Math.max(1000, Number(delayMs)) : interval;
     this.farmRefreshTimer = setTimeout(() => {
       this.farmRefreshTimer = null;
-      this.runFarmRefresh().catch((error) => this.logger.warn(`Farm refresh failed: ${error.message || error}`));
+      this.runFarmRefresh().catch((error) => {
+        const detail = error && error.message ? error.message : String(error);
+        this.logger.warn(`Farm refresh failed: ${detail}`);
+        this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` farm refresh failed: \`${discordInline(detail, 180)}\``);
+      });
     }, delay);
-    this.logger.info(`Farm refresh scheduled in ${Math.round(delay / 1000)}s`);
   }
 
   farmRefreshBusyReason() {
@@ -1000,7 +1063,6 @@ class BotController {
     );
     if (this.lastFarmRefreshAt && Date.now() - this.lastFarmRefreshAt < minInterval) {
       const retryMs = Math.max(1000, this.lastFarmRefreshAt + minInterval - Date.now());
-      this.logger.info(`Farm refresh skipped: last refresh was ${formatDuration(Date.now() - this.lastFarmRefreshAt)} ago; retry in ${formatDuration(retryMs)}`);
       this.scheduleFarmRefresh(retryMs);
       return false;
     }
@@ -1008,7 +1070,6 @@ class BotController {
     const busyReason = this.farmRefreshBusyReason();
     if (busyReason) {
       const retryMs = Math.max(60 * 1000, Number(this.settings.scheduled_reconnect_busy_retry_ms) || 5 * 60 * 1000);
-      this.logger.info(`Farm refresh deferred for ${Math.round(retryMs / 1000)}s: ${busyReason}`);
       this.scheduleFarmRefresh(retryMs);
       return false;
     }
@@ -1025,9 +1086,6 @@ class BotController {
     this.lastFarmRefreshAt = Date.now();
     const wasFarming = this.attackLoopActive || this.status === 'Farming';
     try {
-      const home2Seconds = Math.round(Math.max(1000, Number(this.settings.farm_refresh_home2_wait_ms) || 6000) / 1000);
-      this.logger.info(`Farm refresh: ${home2} -> wait -> ${home1}`);
-      this.manager.dashboard?.sendLog(`♻️ \`${this.displayName()}\` refreshing farm timing: \`${home2}\` for ${home2Seconds}s, then \`${home1}\`.`);
       this.stopAttack(true);
       this.closeCurrentWindow('before farm refresh');
       this.setStatus('Farm Refresh / Home 2');
@@ -3277,6 +3335,39 @@ function isServerSecurityKick(kind, lowerReason) {
   return text.includes('possible unauthorized login') ||
     text.includes('confirm it via the button in your discord dms') ||
     (text.includes('for your own safety') && text.includes('blocked it'));
+}
+
+function isServerBanKick(kind, lowerReason) {
+  if (kind !== 'kicked') return false;
+  const text = String(lowerReason || '').toLowerCase();
+  return (
+    text.includes('temporarily banned') ||
+    text.includes('permanently banned') ||
+    text.includes('you are banned') ||
+    (text.includes('ban id') && text.includes('appeal'))
+  );
+}
+
+function parseServerBan(reasonText) {
+  const text = normalizeMinecraftText(reasonText, { preserveNewlines: true });
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const joined = lines.join('\n');
+  const first = lines[0] || '';
+  const lowerFirst = first.toLowerCase();
+  const type = lowerFirst.includes('permanently banned')
+    ? 'permanent'
+    : lowerFirst.includes('temporarily banned')
+      ? 'temporary'
+      : lowerFirst.includes('banned')
+        ? 'ban'
+        : '';
+  const timeMatch = joined.match(/time\s+left\s*:\s*([^\n]+)/i);
+  const idMatch = joined.match(/ban\s+id\s*:\s*(#[A-Za-z0-9_-]+)/i);
+  return {
+    type,
+    timeLeft: timeMatch ? timeMatch[1].trim() : '',
+    id: idMatch ? idMatch[1].trim() : ''
+  };
 }
 
 function parseTpaSender(message) {
