@@ -2618,8 +2618,7 @@ class BotController {
     if (!axeReady || !this.attackLoopActive || !this.bot || this.disconnectHandled) return;
 
     const reach = Math.max(1, Number(this.settings.farm_reach_blocks) || 4.5);
-    await this.ensureFarmCameraLocked();
-    const target = await this.selectAttackTarget(reach);
+    const target = this.selectAttackTarget(reach);
     if (!target) {
       this.logNoTargetDiagnostics(reach);
       return;
@@ -2637,7 +2636,7 @@ class BotController {
       this.recordFarmTarget(target);
       
       await Promise.race([
-        this.bot.dig(target, false, 'raycast'),
+        this.bot.dig(target, true, 'raycast'),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Digging timed out')), 800))
       ]);
       
@@ -2655,12 +2654,9 @@ class BotController {
     }
   }
 
-  async selectAttackTarget(reach) {
+  selectAttackTarget(reach) {
     const cursorTarget = this.bot ? this.bot.blockAtCursor(reach) : null;
     if (this.isAllowedAttackBlock(cursorTarget)) return cursorTarget;
-
-    const fallbackTarget = await this.findCursorFallbackTarget(reach);
-    if (fallbackTarget) return fallbackTarget;
 
     const targets = this.findAttackTargets(reach);
     if (!targets.length) return null;
@@ -2674,43 +2670,6 @@ class BotController {
     this.attackTargetCycleIndex = (this.attackTargetCycleIndex + 1) % targets.length;
     this.logThrottled('farm-scan-fallback-target', `Cursor target missing; using scan fallback ${this.describeBlock(target)}`, 10000);
     return target;
-  }
-
-  async findCursorFallbackTarget(reach) {
-    if (this.settings.cursor_fallback_enabled === false || !this.bot || !this.bot.entity) return null;
-
-    const baseYaw = yawForCardinal(this.config.server.target_cardinal_direction || 'SOUTH');
-    const configuredPitch = Number(this.config.server.pitch_degrees);
-    const basePitch = ((Number.isFinite(configuredPitch) ? configuredPitch : -89) * Math.PI) / 180;
-    const yawOffsets = Array.isArray(this.settings.cursor_fallback_yaw_degrees)
-      ? this.settings.cursor_fallback_yaw_degrees
-      : [0];
-    const pitchOffsets = Array.isArray(this.settings.cursor_fallback_pitch_degrees)
-      ? this.settings.cursor_fallback_pitch_degrees
-      : [0];
-
-    for (const pitchOffset of pitchOffsets) {
-      for (const yawOffset of yawOffsets) {
-        const yaw = baseYaw + (Number(yawOffset) || 0) * Math.PI / 180;
-        const pitch = basePitch + (Number(pitchOffset) || 0) * Math.PI / 180;
-        try {
-          await this.bot.look(yaw, pitch, true);
-          const block = this.bot.blockAtCursor(reach);
-          if (this.isAllowedAttackBlock(block)) {
-            this.logThrottled(
-              'farm-cursor-fallback-target',
-              `Cursor fallback target ${this.describeBlock(block)} yawOffset=${yawOffset} pitchOffset=${pitchOffset}`,
-              10000
-            );
-            return block;
-          }
-        } catch (error) {
-          this.logThrottled('farm-cursor-fallback-failed', `Cursor fallback look failed: ${error.message || error}`, 10000);
-        }
-      }
-    }
-
-    return null;
   }
 
   findAttackTargets(reach) {
