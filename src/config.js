@@ -66,7 +66,7 @@ const DEFAULT_CONFIG = {
     balance_interval_ms: 300000,
     profit_window_ms: 300000,
     profit_warmup_ms: 300000,
-    profit_reference_per_hour: 47500000,
+    profit_reference_per_hour: 23000000,
     profit_reference_min_peer_count: 2,
     profit_reference_use_configured_floor: false,
     profit_alert_enabled: true,
