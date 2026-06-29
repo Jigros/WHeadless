@@ -153,6 +153,8 @@ class BotController {
     this.attackTargetCycleIndex = 0;
     this.lastTargetLogAt = 0;
     this.lastThrottleLog = new Map();
+    this.lastMicrosoftAuthServiceAlertAt = 0;
+    this.microsoftAuthServiceRetryAttempt = 0;
     this.lastPlayerAlertAt = new Map();
     this.proxyFailureTimes = [];
     this.chatLog = [];
@@ -411,6 +413,7 @@ class BotController {
       this.rememberProfileName(bot.username, 'login');
       this.lastMsaUserCode = '';
       this.lastMsaCodeAt = 0;
+      this.microsoftAuthServiceRetryAttempt = 0;
       this.kickRetryAttempt = false;
       this.phase = 'play';
       this.setStatus('Logged In');
@@ -699,6 +702,7 @@ class BotController {
     let isSecurity = kind === 'kicked' && classification.category === 'Server Security';
     let isBan = kind === 'kicked' && classification.category === 'Server Ban';
     let isTicket = kind === 'kicked' && (lowerReason.includes('make a ticket') || lowerReason.includes("don't know what happened"));
+    let isMicrosoftAuthService = classification.category === 'Microsoft Auth Service';
 
     if (isBan) {
       this.handleServerBan(reasonText, classification);
@@ -706,7 +710,7 @@ class BotController {
     }
 
     let fastRetry = false;
-    if ((kind === 'kicked' || kind === 'error') && !suppressExpectedRestartDisconnect && !isGhostSession && !isSecurity && !isTicket) {
+    if ((kind === 'kicked' || kind === 'error') && !suppressExpectedRestartDisconnect && !isGhostSession && !isSecurity && !isTicket && !isMicrosoftAuthService) {
       if (!this.kickRetryAttempt) {
         fastRetry = true;
         this.kickRetryAttempt = true;
@@ -720,7 +724,9 @@ class BotController {
       const display = this.displayName();
       
       const isSpam = classification.category === 'Minecraft Profile' || classification.category === 'Minecraft Session';
-      if (!isSpam) {
+      if (isMicrosoftAuthService) {
+        this.notifyMicrosoftAuthServiceIssue(emoji, display, kind, reasonText, classification);
+      } else if (!isSpam) {
         this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\`${this.disconnectDiagnosticSuffix(kind, reasonText, classification)}`);
       }
     }
@@ -747,6 +753,11 @@ class BotController {
       this.setStatus('Server Ticket / Wait 12m');
       this.logger.warn('Ticket-style kick detected; auto-reconnecting in 12 minutes');
       this.reconnectTimer = setTimeout(() => this.connect(), 12 * 60 * 1000);
+      return;
+    }
+
+    if (isMicrosoftAuthService) {
+      this.scheduleMicrosoftAuthServiceReconnect(kind);
       return;
     }
 
@@ -869,6 +880,9 @@ class BotController {
     if (classification.category === 'Minecraft Session') {
       lines.push('note=Mojang session join failed before server login. If the next login works, treat this as transient Mojang/session/proxy failure.');
     }
+    if (classification.category === 'Microsoft Auth Service') {
+      lines.push('note=Microsoft/Xbox auth service failed before Minecraft login. This is usually transient; retrying with slower backoff.');
+    }
     return `\nDiagnostics: \`${discordInline(lines.join(' | '), 900)}\``;
   }
 
@@ -889,6 +903,13 @@ class BotController {
     }
     if (lower.includes('sessionserver.mojang.com') || lower.includes('/session/minecraft/join') || lower.includes('minecraft/join')) {
       return { category: 'Minecraft Session', message: 'Mojang session join request failed before server login. This is usually transient network/proxy/sessionserver failure.' };
+    }
+    if (
+      lower.includes('/authentication/login_with_xbox') ||
+      lower.includes('login_with_xbox') ||
+      (lower.includes('503 service unavailable') && (lower.includes('xbox') || lower.includes('microsoftauthflow') || lower.includes('prismarine-auth')))
+    ) {
+      return { category: 'Microsoft Auth Service', message: 'Microsoft/Xbox authentication service returned 503 before Minecraft login. This is usually transient; the bot will retry more slowly.' };
     }
     if (lower.includes('proxy') || lower.includes('socks') || lower.includes('connect timed out') || lower.includes('econnrefused') || lower.includes('enotfound') || lower.includes('ehostunreach')) {
       return { category: 'Proxy', message: 'Proxy connection failed or timed out.' };
@@ -1003,6 +1024,29 @@ class BotController {
     const delay = randomInt(min, max);
     this.setStatus('Offline / Reconnecting');
     this.logger.info(`Scheduling reconnect in ${Math.round(delay / 1000)}s after ${source}`);
+    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+  }
+
+  notifyMicrosoftAuthServiceIssue(emoji, display, kind, reasonText, classification) {
+    const now = Date.now();
+    const cooldownMs = Math.max(60 * 1000, Number(this.settings.microsoft_auth_service_alert_cooldown_ms) || 15 * 60 * 1000);
+    if (this.lastMicrosoftAuthServiceAlertAt && now - this.lastMicrosoftAuthServiceAlertAt < cooldownMs) return;
+    this.lastMicrosoftAuthServiceAlertAt = now;
+    this.manager.dashboard?.sendLog(`${emoji} \`${display}\` disconnected. Kind: **${kind}** Category: **${classification.category}**\nReason: \`\`\`\n${classification.message}\n\`\`\`${this.disconnectDiagnosticSuffix(kind, reasonText, classification)}`);
+  }
+
+  scheduleMicrosoftAuthServiceReconnect(source) {
+    if (this.userPaused || this.pausedAuto) return;
+    this.clearReconnectTimer();
+    const min = Math.max(60 * 1000, Number(this.settings.microsoft_auth_service_retry_min_ms) || 5 * 60 * 1000);
+    const max = Math.max(min, Number(this.settings.microsoft_auth_service_retry_max_ms) || 30 * 60 * 1000);
+    const attempt = Math.max(1, this.microsoftAuthServiceRetryAttempt + 1);
+    this.microsoftAuthServiceRetryAttempt = attempt;
+    const baseDelay = Math.min(max, min * Math.pow(2, attempt - 1));
+    const jitter = randomInt(0, Math.max(1000, Math.floor(baseDelay * 0.2)));
+    const delay = Math.min(max, baseDelay + jitter);
+    this.setStatus(`Auth Service Retry (${Math.ceil(delay / 60000)}m)`);
+    this.logger.warn(`Microsoft/Xbox auth service failure; scheduling reconnect in ${Math.round(delay / 1000)}s after ${source} attempt=${attempt}`);
     this.reconnectTimer = setTimeout(() => this.connect(), delay);
   }
 
