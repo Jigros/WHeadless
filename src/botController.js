@@ -2437,11 +2437,58 @@ class BotController {
       const chunks = this.cashoutPaymentPlan(amount);
       const chunkDelayMs = this.cashoutChunkDelayMs();
       let acceptedChunks = 0;
+      const shouldTryFullAmountFirst = chunks.length > 1;
 
-      if (chunks.length > 1) {
+      if (shouldTryFullAmountFirst) {
         this.logger.warn(
-          `Cashout split into ${chunks.length} payments: total=${amount} maxSingle=${this.cashoutMaxSinglePaymentAmount()} chunkDelay=${chunkDelayMs}ms`
+          `Cashout trying full amount first: total=${amount}; fallbackChunks=${chunks.length} maxChunk=${this.cashoutMaxSinglePaymentAmount()} chunkDelay=${chunkDelayMs}ms`
         );
+        const fullAmountSent = await this.sendCashoutPaymentWithRetry(payment, cashoutNickname, amount, {
+          replyWaitMs,
+          isRecoveryRetry,
+          index: 0,
+          totalChunks: 1,
+          balanceSource: before.source,
+          temporaryRetry: false
+        });
+
+        if (fullAmountSent) {
+          const verified = await this.verifyCashoutBalanceDrop(before.balance, amount);
+          if (verified.ok) {
+            this.logger.info(`Cashout confirmed amount=${amount} target=${cashoutNickname} ${verified.reason}`);
+            return true;
+          }
+
+          if (payment.error) {
+            const reason = payment.message || 'server rejected payment';
+            this.logger.warn(`Cashout rejected during verification: ${reason}`);
+            this.closeCurrentWindow('after failed cashout');
+            this.manager.dashboard?.sendLog(`❌ \`${this.displayName()}\` failed to cashout **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`);
+            return false;
+          }
+
+          if (payment.success) {
+            this.logger.info(`Cashout accepted by server amount=${amount} target=${cashoutNickname}${payment.message ? ` reply=${payment.message.slice(0, 160)}` : ''}`);
+            this.recordCashoutAcceptedLocally(before.balance, amount);
+            return true;
+          }
+
+          const lastBalance = Number.isFinite(verified.balance) ? `$${formatCompactMoney(verified.balance)}` : 'unknown';
+          const reason = this.cashoutFailureReason(payment, verified);
+          this.logger.warn(`Cashout unconfirmed amount=${amount} target=${cashoutNickname} balanceBefore=${before.balance} balanceAfter=${lastBalance} reason=${reason}`);
+          this.closeCurrentWindow('after unconfirmed cashout');
+          this.manager.dashboard?.sendLog(
+            `⚠️ \`${this.displayName()}\` cashout to \`${cashoutNickname}\` is **not confirmed**. Tried: **$${amount.toLocaleString('en-US')}**. Balance now: \`${lastBalance}\`. Reason: \`${discordInline(reason, 220)}\`${this.cashoutDiagnosticSuffix(payment)}`
+          );
+          return false;
+        }
+
+        const reason = payment.message || latestCashoutChatReason(payment) || 'server rejected full payment';
+        this.logger.warn(`Cashout full amount rejected amount=${amount}; falling back to ${chunks.length} chunks max=${this.cashoutMaxSinglePaymentAmount()}: ${reason}`);
+        this.manager.dashboard?.sendLog(
+          `⚠️ \`${this.displayName()}\` full cashout **$${amount.toLocaleString('en-US')}** was rejected; trying chunks up to **$${this.cashoutMaxSinglePaymentAmount().toLocaleString('en-US')}**. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`
+        );
+        acceptedChunks = 0;
       }
 
       for (let index = 0; index < chunks.length; index += 1) {
@@ -2512,10 +2559,12 @@ class BotController {
 
   async sendCashoutPaymentWithRetry(payment, target, amount, options = {}) {
     const replyWaitMs = Math.max(1000, Number(options.replyWaitMs) || Number(this.settings.cashout_reply_wait_ms) || 5000);
-    const retryDelayMs = Math.max(1000, Number(this.settings.cashout_temporary_retry_delay_ms) || 30000);
+    const configuredRetryDelayMs = Number(this.settings.cashout_temporary_retry_delay_ms);
+    const retryDelayMs = Number.isFinite(configuredRetryDelayMs) ? Math.max(0, Math.floor(configuredRetryDelayMs)) : 0;
     const index = Number(options.index) || 0;
     const totalChunks = Math.max(1, Number(options.totalChunks) || 1);
     const chunkLabel = totalChunks > 1 ? ` ${index + 1}/${totalChunks}` : '';
+    const temporaryRetry = options.temporaryRetry !== false;
 
     const sendOnce = async (retry = false) => {
       resetCashoutPaymentForRetry(payment);
@@ -2532,15 +2581,17 @@ class BotController {
     };
 
     await sendOnce(false);
-    if (payment.error && isTemporaryCashoutFailure(payment.message) && !options.isRecoveryRetry) {
+    if (payment.error && temporaryRetry && isTemporaryCashoutFailure(payment.message) && !options.isRecoveryRetry) {
       const reason = payment.message || 'server refused this payment amount';
-      this.logger.warn(`Cashout payment refused; retrying in ${Math.round(retryDelayMs / 1000)}s amount=${amount}: ${reason}`);
+      this.logger.warn(`Cashout payment refused; retrying ${retryDelayMs > 0 ? `in ${Math.round(retryDelayMs / 1000)}s` : 'now'} amount=${amount}: ${reason}`);
       this.closeCurrentWindow('after temporary cashout error');
       this.manager.dashboard?.sendLog(
-        `⚠️ \`${this.displayName()}\` cashout payment **$${amount.toLocaleString('en-US')}** was refused; retrying in **${Math.round(retryDelayMs / 1000)}s**. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`
+        `⚠️ \`${this.displayName()}\` cashout payment **$${amount.toLocaleString('en-US')}** was refused; retrying ${retryDelayMs > 0 ? `in **${Math.round(retryDelayMs / 1000)}s**` : '**now**'}. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`
       );
-      this.setStatus(`Cashout Retry Wait (${Math.round(retryDelayMs / 1000)}s)`);
-      await sleep(retryDelayMs);
+      if (retryDelayMs > 0) {
+        this.setStatus(`Cashout Retry Wait (${Math.round(retryDelayMs / 1000)}s)`);
+        await sleep(retryDelayMs);
+      }
       if (!this.bot || this.disconnectHandled || this.userPaused) return false;
       await sendOnce(true);
     }
@@ -2565,15 +2616,16 @@ class BotController {
   }
 
   cashoutMaxSinglePaymentAmount() {
+    const hardMax = 10000000;
     const value = Number(this.settings.cashout_max_single_payment_amount);
-    if (!Number.isFinite(value)) return 20000000;
-    if (value <= 0) return Infinity;
-    return Math.max(1, Math.floor(value));
+    if (!Number.isFinite(value)) return hardMax;
+    if (value <= 0) return hardMax;
+    return Math.min(hardMax, Math.max(1, Math.floor(value)));
   }
 
   cashoutChunkDelayMs() {
     const value = Number(this.settings.cashout_chunk_delay_ms);
-    if (!Number.isFinite(value)) return 5000;
+    if (!Number.isFinite(value)) return 0;
     return Math.max(0, Math.floor(value));
   }
 
