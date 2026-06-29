@@ -707,12 +707,6 @@ class BotController {
       return;
     }
 
-    if (kind === 'kicked' && !suppressExpectedRestartDisconnect && !this.settings.reconnect_on_kick) {
-      this.pausedAuto = true;
-      this.setStatus('Kicked / Reconnect Paused');
-      return;
-    }
-
     if (fastRetry) {
       this.clearReconnectTimer();
       this.setStatus('Fast Retry / Wait 10s');
@@ -1441,6 +1435,10 @@ class BotController {
 
     const stuckMs = this.getHomeRecoveryStuckMs();
     if (!this.homeRecoveryLastMovedAt || now - this.homeRecoveryLastMovedAt < stuckMs) return;
+    if (this.shouldIgnoreHomeRecoveryNoTargetGap(now)) {
+      this.markHomeRecoveryMovement(now);
+      return;
+    }
     if (!this.canStartHomeRecovery(now)) {
       const waitMs = Math.max(0, this.homeRecoveryNextStartAllowedAt - now);
       this.logThrottled(
@@ -1518,6 +1516,28 @@ class BotController {
   shouldIgnorePassiveHomeRecoveryMovement() {
     if (this.settings.home_recovery_ignore_passive_movement === false) return false;
     return this.attackLoopActive || this.status === 'Farming';
+  }
+
+  shouldIgnoreHomeRecoveryNoTargetGap(now = Date.now()) {
+    if (this.settings.home_recovery_ignore_no_target_farming === false) return false;
+    if (!this.attackLoopActive && this.status !== 'Farming') return false;
+    if (this.isDigging()) return false;
+    if (!this.lastFarmTarget || !this.lastFarmTarget.at) return false;
+
+    const graceMs = Math.max(1000, Number(this.settings.home_recovery_no_target_grace_ms) || 120000);
+    if (now - this.lastFarmTarget.at > graceMs) return false;
+
+    const reach = Math.max(1, Number(this.settings.farm_reach_blocks) || 4.5);
+    const targets = this.findAttackTargets(reach);
+    if (targets.length > 0) return false;
+
+    const cursorBlock = this.bot ? this.bot.blockAtCursor(reach) : null;
+    this.logThrottled(
+      'home-recovery-no-target-gap',
+      `Home Recovery: ignoring temporary farming no-target gap cursor=${this.describeBlock(cursorBlock)} lastTarget=${this.lastFarmTarget.name}@${this.lastFarmTarget.position.x},${this.lastFarmTarget.position.y},${this.lastFarmTarget.position.z} ${formatDuration(now - this.lastFarmTarget.at)} ago`,
+      30000
+    );
+    return true;
   }
 
   homeRecoveryInactivityReason(stuckMs) {
@@ -1807,16 +1827,65 @@ class BotController {
 
   async refreshBalance() {
     const username = this.statsUsername();
-    let result = await this.getGameBalance(username);
+    let result = await this.donutApi.getBalance(username, {
+      botKey: this.botConfig.username,
+      displayName: this.displayName()
+    });
 
-    if (!result || !result.ok) {
+    if (isTransientBalanceApiError(result)) {
+      const gameBalance = await this.getGameBalanceFallback(result);
+      if (gameBalance && gameBalance.ok) result = gameBalance;
+      else if (gameBalance) {
+        result = {
+          ...result,
+          gameCode: gameBalance.code || '',
+          chat: Array.isArray(gameBalance.chat) ? gameBalance.chat : []
+        };
+      }
+    }
+
+    if (!result) {
       result = { ok: false, code: 'NO_BALANCE', label: '-', balance: null };
+    } else if (result.ok) {
+      const suspiciousReason = this.suspiciousBalanceResultReason(result.balance);
+      if (suspiciousReason) {
+        this.logger.warn(
+          `Ignored suspicious balance result for ${this.displayName()}: ${suspiciousReason}; value=${formatMoney(result.balance)} last=${formatMoney(this.lastBalance)}`
+        );
+        result = {
+          ...result,
+          ok: false,
+          code: suspiciousReason,
+          ignoredBalance: result.balance,
+          balance: null,
+          label: Number.isFinite(this.lastBalance) ? formatMoney(this.lastBalance) : '-'
+        };
+      } else {
+        this.applyBalanceResult(result);
+      }
     } else {
-      this.applyBalanceResult(result);
+      const cachedLabel = this.cachedBalanceLabelForTransientError(result);
+      if (cachedLabel) result = { ...result, label: cachedLabel, cachedLabel: true };
+      else if (!result.label) result = { ...result, label: '-' };
     }
     
     this.balanceLabel = result.label;
     return result;
+  }
+
+  suspiciousBalanceResultReason(balance, now = Date.now()) {
+    if (!Number.isFinite(balance)) return '';
+    if (!Number.isFinite(this.lastBalance) || !this.lastBalanceAt) return '';
+    if (this.pendingCashout || this.status === 'Cashout') return '';
+
+    const elapsedMs = Math.max(1, now - this.lastBalanceAt);
+    if (balance > this.lastBalance && this.isSuspiciousProfitDelta(balance - this.lastBalance, elapsedMs)) {
+      return 'SUSPICIOUS_BALANCE_JUMP';
+    }
+    if (this.lastBalance > 1000000 && balance < this.lastBalance * 0.2 && elapsedMs <= this.balanceCacheMaxAgeMs()) {
+      return 'SUSPICIOUS_BALANCE_DROP';
+    }
+    return '';
   }
 
   applyBalanceResult(result) {
@@ -1828,8 +1897,17 @@ class BotController {
         this.profitSamples = [{ at: now, balance: result.balance }];
         this.resetProfitAlertState();
       } else if (result.balance > this.lastBalance) {
+        const delta = result.balance - this.lastBalance;
+        const elapsedMs = Math.max(1, now - (this.lastBalanceAt || now));
+        if (this.isSuspiciousProfitDelta(delta, elapsedMs)) {
+          this.resetProfitTracking(result.balance, now);
+          this.logger.warn(
+            `Ignored suspicious balance jump for profit stats: delta=$${formatCompactMoney(delta)} in ${formatDuration(elapsedMs)} balance=${formatMoney(result.balance)}`
+          );
+          return;
+        }
         // Второе и последующие измерения
-        this.sessionEarned += (result.balance - this.lastBalance);
+        this.sessionEarned += delta;
         this.profitSamples.push({ at: now, balance: result.balance });
       } else if (result.balance < this.lastBalance) {
         // Баланс упал (произошел Cashout). 
@@ -1852,6 +1930,28 @@ class BotController {
     }
   }
 
+  isSuspiciousProfitDelta(delta, elapsedMs) {
+    if (!Number.isFinite(delta) || delta <= 0) return false;
+    const hours = Math.max(1 / 3600, Number(elapsedMs) / 3600000);
+    const perHour = delta / hours;
+    const reference = Math.max(1, Number(this.settings.profit_reference_per_hour) || 47500000);
+    const threshold = Math.max(reference * 8, 250000000);
+    return perHour > threshold;
+  }
+
+  resetProfitTracking(balance, now = Date.now()) {
+    this.sessionStartTime = now;
+    this.sessionEarned = 0;
+    this.currentPerHour = 0;
+    this.shortPerHour = 0;
+    this.profitReady = false;
+    this.profitSamples = [{ at: now, balance }];
+    this.lastBalance = balance;
+    this.lastBalanceAt = now;
+    this.resetProfitAlertState();
+    this.updateProfitMetrics(now);
+  }
+
   async getGameBalanceFallback(apiResult) {
     return this.getGameBalance(this.statsUsername(), { apiResult });
   }
@@ -1866,6 +1966,7 @@ class BotController {
     const waitMs = Math.max(1000, Number(this.settings.balance_command_wait_ms) || 5000);
     const startedAt = Date.now();
     const apiResult = options.apiResult || null;
+    const capturedChat = [];
     const promise = new Promise((resolve) => {
       let settled = false;
       let timeoutId = null;
@@ -1877,9 +1978,13 @@ class BotController {
         this.bot?.removeListener('messagestr', listener);
         resolve(result);
       };
-      const listener = (jsonMsg) => {
+      const listener = (...args) => {
         try {
+          const jsonMsg = args[0];
+          const chatKind = normalizeChatKind(args[1] || '');
+          if (chatKind === 'game_info') return;
           const rawText = normalizeMinecraftText(jsonMsg, { maxDepth: 10, maxStrings: 80 }).trim();
+          rememberGameBalanceChatLine(capturedChat, rawText, chatKind);
           const balance = parseGameBalanceMessage(rawText, username);
           if (!Number.isFinite(balance)) return;
           finish({
@@ -1889,7 +1994,8 @@ class BotController {
             balance,
             source: 'game',
             username: String(username || ''),
-            apiCode: apiResult && apiResult.code ? apiResult.code : ''
+            apiCode: apiResult && apiResult.code ? apiResult.code : '',
+            chat: capturedChat.slice(-8)
           });
         } catch (error) {}
       };
@@ -1908,7 +2014,8 @@ class BotController {
           source: 'game',
           username: String(username || ''),
           apiCode: apiResult && apiResult.code ? apiResult.code : '',
-          elapsedMs: Date.now() - startedAt
+          elapsedMs: Date.now() - startedAt,
+          chat: capturedChat.slice(-8)
         });
       }, waitMs);
     }).finally(() => {
@@ -1920,13 +2027,14 @@ class BotController {
     if (result.ok) {
       this.logger.info(`In-game balance ok target=${username || 'self'} balance=${formatMoney(result.balance)} sourceApi=${result.apiCode || '-'}`);
     } else {
-      this.logger.warn(`In-game balance failed target=${username || 'self'} code=${result.code} sourceApi=${result.apiCode || '-'}`);
+      this.logger.warn(`In-game balance failed target=${username || 'self'} code=${result.code} sourceApi=${result.apiCode || '-'}${gameBalanceDiagnosticSuffix(result)}`);
     }
     return result;
   }
 
   gameBalanceCommand(username) {
-    const base = String(this.settings.balance_command || '/bal').trim();
+    let base = String(this.settings.balance_command || '/balance').trim();
+    if (base === '/bal') base = '/balance';
     if (!base) return '';
     const target = String(username || '').trim();
     if (!target || this.isOwnBalanceName(target)) return base;
@@ -1975,7 +2083,7 @@ class BotController {
     if (result && result.ok && Number.isFinite(result.balance) && result.balance > 0) {
       return {
         balance: result.balance,
-        source: 'api',
+        source: result.source || 'balance',
         ageMs: 0,
         code: result.code || 'OK'
       };
@@ -2169,8 +2277,11 @@ class BotController {
       const reason = balanceResult && balanceResult.code
         ? `balance unavailable (${balanceResult.code}) and no fresh cached balance`
         : 'balance unavailable and no fresh cached balance';
-      this.logger.warn(`Cashout skipped: ${reason}`);
-      this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` cashout skipped. Reason: \`${discordInline(reason, 180)}\``);
+      const chatDetail = balanceResult && Array.isArray(balanceResult.chat)
+        ? gameBalanceDiscordDiagnostic(balanceResult)
+        : '';
+      this.logger.warn(`Cashout skipped: ${reason}${gameBalanceDiagnosticSuffix(balanceResult)}`);
+      this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` cashout skipped. Reason: \`${discordInline(`${reason}${chatDetail ? ` ${chatDetail}` : ''}`, 700)}\``);
       return false;
     }
     const cashoutNickname = String(this.config.cashout_nickname || '').trim();
@@ -2193,14 +2304,18 @@ class BotController {
       error: false,
       message: '',
       replies: [],
+      chat: [],
       target: cashoutNickname,
       amount,
       startedAt: Date.now()
     };
 
-    const replyListener = (jsonMsg) => {
+    const replyListener = (...args) => {
       try {
+        const jsonMsg = args[0];
+        const chatKind = normalizeChatKind(args[1] || '');
         const rawText = normalizeMinecraftText(jsonMsg, { maxDepth: 10 }).trim();
+        rememberCashoutChat(payment, rawText, chatKind);
         const classified = classifyCashoutReply(rawText, cashoutNickname, amount);
         if (!classified) return;
         rememberCashoutReply(payment, classified.message || rawText);
@@ -2253,18 +2368,12 @@ class BotController {
       }
 
       const lastBalance = Number.isFinite(verified.balance) ? `$${formatCompactMoney(verified.balance)}` : 'unknown';
-      const reason = verified.reason || 'no server success reply and source balance did not drop enough';
+      const reason = this.cashoutFailureReason(payment, verified);
       this.logger.warn(`Cashout unconfirmed amount=${amount} target=${cashoutNickname} balanceBefore=${before.balance} balanceAfter=${lastBalance} reason=${reason}`);
       this.closeCurrentWindow('after unconfirmed cashout');
       this.manager.dashboard?.sendLog(
         `⚠️ \`${this.displayName()}\` cashout to \`${cashoutNickname}\` is **not confirmed**. Tried: **$${amount.toLocaleString('en-US')}**. Balance now: \`${lastBalance}\`. Reason: \`${discordInline(reason, 220)}\`${this.cashoutDiagnosticSuffix(payment)}`
       );
-      if (!isRecoveryRetry && this.settings.cashout_retry_after_reconnect !== false) {
-        this.queueCashoutRetryAfterReconnect(reason);
-      }
-      if (this.settings.cashout_reconnect_on_unconfirmed !== false) {
-        this.recoverCommandChannel(`cashout unconfirmed; ${reason}`);
-      }
       return false;
     } finally {
       this.bot?.removeListener('message', replyListener);
@@ -2311,12 +2420,25 @@ class BotController {
     };
   }
 
+  cashoutFailureReason(payment, verified) {
+    const chatReason = latestCashoutChatReason(payment);
+    const verifyReason = verified && verified.reason ? String(verified.reason) : '';
+    if (chatReason && verifyReason) return `${chatReason}; ${verifyReason}`;
+    if (chatReason) return chatReason;
+    if (verifyReason) return `Minecraft chat did not show a payment error; ${verifyReason}`;
+    return 'Minecraft chat did not show a payment error and balance did not confirm the transfer';
+  }
+
   cashoutDiagnosticSuffix(payment) {
     if (!payment) return '';
     const lines = [];
     for (const reply of payment.replies || []) {
       if (!shouldShowMinecraftChatLine({ direction: 'IN', text: reply, kind: 'system' })) continue;
       lines.push(reply);
+    }
+    for (const text of payment.chat || []) {
+      if (!shouldShowMinecraftChatLine({ direction: 'IN', text, kind: 'system' })) continue;
+      if (!lines.includes(text)) lines.push(text);
     }
     const startedAt = Number(payment.startedAt) || Date.now();
     for (const entry of this.chatLog.slice(-12)) {
@@ -3008,12 +3130,12 @@ class BotController {
 
   async handleTpa(sender) {
     if (this.tpaInProgress || !this.bot || this.disconnectHandled) return;
+    const tpaStartedAt = Date.now();
     this.tpaInProgress = true;
     this.pendingTpaSender = sender;
     this.tpaAcceptedNotified = false;
     this.tpaAttemptNotified = false;
     this.tpaFailureNotified = false;
-    let shouldRecoverCommandChannel = false;
     try {
       this.logger.info(`Starting TPA workflow for ${sender}`);
       this.stopAttack(true);
@@ -3036,18 +3158,15 @@ class BotController {
 
       this.sendChat(this.settings.home_farm_command);
       await sleep(Number(this.settings.teleport_wait_ms) || 1000);
-      shouldRecoverCommandChannel = this.settings.tpa_reconnect_on_no_confirmation !== false &&
-        !this.tpaAcceptedNotified &&
-        !this.tpaFailureNotified;
+      if (!this.tpaAcceptedNotified && !this.tpaFailureNotified) {
+        this.logger.warn(`TPA workflow for ${sender} had no server confirmation after return home; reconnect disabled`);
+        this.notifyTpaNoConfirmation(sender, tpaStartedAt);
+      }
     } finally {
       this.tpaInProgress = false;
       this.pendingTpaSender = '';
       if (this.status === 'TPA Trade' || this.status === 'Waiting Return') this.setStatus('Ready');
-      if (shouldRecoverCommandChannel) {
-        this.recoverCommandChannel(`TPA accept for ${sender} had no server confirmation`);
-      } else {
-        this.startFarming();
-      }
+      this.startFarming();
     }
   }
 
@@ -3086,6 +3205,31 @@ class BotController {
     const reason = detail ? ` Reason: \`${String(detail).slice(0, 180)}\`` : '';
     this.logger.warn(`TPA accept may have failed for ${sender}${detail ? `: ${detail}` : ''}`);
     this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` TPA accept may have failed for **${sender}**.${reason}`);
+  }
+
+  notifyTpaNoConfirmation(sender, startedAt = Date.now()) {
+    if (this.tpaFailureNotified || this.tpaAcceptedNotified) return;
+    this.tpaFailureNotified = true;
+    const suffix = this.tpaDiagnosticSuffix(startedAt);
+    const reason = suffix
+      ? `Minecraft chat did not confirm TPA accept. ${suffix}`
+      : 'Minecraft chat did not confirm TPA accept and no useful chat lines were captured.';
+    this.logger.warn(`TPA accept not confirmed for ${sender}: ${reason}`);
+    this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` TPA accept may have failed for **${sender}**. Reason: \`${discordInline(reason, 700)}\``);
+  }
+
+  tpaDiagnosticSuffix(startedAt = Date.now()) {
+    const lines = [];
+    for (const entry of this.chatLog.slice(-30)) {
+      if (!entry || !entry.text || entry.at < startedAt - 2000) continue;
+      if (entry.direction !== 'IN') continue;
+      if (!shouldShowMinecraftChatLine(entry)) continue;
+      const text = normalizeMinecraftText(entry.text).trim();
+      if (!text || lines.includes(text)) continue;
+      lines.push(text);
+    }
+    const shown = lines.map((line) => discordInline(line, 160)).filter(Boolean).slice(-5);
+    return shown.length ? `Chat: ${shown.map((line) => `\`${line}\``).join(' | ')}` : '';
   }
 
   findWhitelistedTpaSender(message) {
@@ -3222,6 +3366,67 @@ function rememberCashoutReply(payment, message) {
   if (!Array.isArray(payment.replies)) payment.replies = [];
   if (payment.replies[payment.replies.length - 1] !== text) payment.replies.push(text.slice(0, 500));
   if (payment.replies.length > 12) payment.replies.splice(0, payment.replies.length - 12);
+}
+
+function rememberGameBalanceChatLine(lines, message, kind = '') {
+  if (!Array.isArray(lines)) return;
+  const text = normalizeMinecraftText(message).trim();
+  if (!text) return;
+  const chatKind = normalizeChatKind(kind);
+  if (!shouldShowMinecraftChatLine({ direction: 'IN', text, kind: chatKind })) return;
+  if (lines[lines.length - 1] !== text) lines.push(text.slice(0, 500));
+  if (lines.length > 12) lines.splice(0, lines.length - 12);
+}
+
+function gameBalanceDiagnosticSuffix(result) {
+  const chat = result && Array.isArray(result.chat) ? result.chat : [];
+  const shown = chat.map((line) => discordInline(line, 160)).filter(Boolean).slice(-5);
+  return shown.length ? ` chat=${shown.map((line) => `"${line}"`).join(' | ')}` : ' chat=none';
+}
+
+function gameBalanceDiscordDiagnostic(result) {
+  const chat = result && Array.isArray(result.chat) ? result.chat : [];
+  const shown = chat.map((line) => discordInline(line, 160)).filter(Boolean).slice(-5);
+  return shown.length ? `Minecraft chat: ${shown.map((line) => `\`${line}\``).join(' | ')}` : 'Minecraft chat: no useful lines captured';
+}
+
+function rememberCashoutChat(payment, message, kind = '') {
+  if (!payment) return;
+  const text = normalizeMinecraftText(message).trim();
+  if (!text) return;
+  const chatKind = normalizeChatKind(kind);
+  if (!shouldShowMinecraftChatLine({ direction: 'IN', text, kind: chatKind })) return;
+  if (!Array.isArray(payment.chat)) payment.chat = [];
+  const entry = text.slice(0, 500);
+  if (payment.chat[payment.chat.length - 1] !== entry) payment.chat.push(entry);
+  if (payment.chat.length > 12) payment.chat.splice(0, payment.chat.length - 12);
+}
+
+function latestCashoutChatReason(payment) {
+  if (!payment) return '';
+  const replies = Array.isArray(payment.replies) ? payment.replies : [];
+  if (payment.message) return normalizeMinecraftText(payment.message).trim();
+  if (replies.length) return normalizeMinecraftText(replies[replies.length - 1]).trim();
+
+  const chat = Array.isArray(payment.chat) ? payment.chat : [];
+  const target = String(payment.target || '').toLowerCase();
+  const amount = Number(payment.amount);
+  const amountText = Number.isFinite(amount) && amount > 0 ? String(Math.floor(amount)) : '';
+  for (let index = chat.length - 1; index >= 0; index -= 1) {
+    const text = normalizeMinecraftText(chat[index]).trim();
+    if (!text) continue;
+    const lower = text.toLowerCase();
+    const compact = text.replace(/[,\s]/g, '');
+    if (
+      /pay|paid|payment|transfer|sent|balance|money|cash|\$|донат|перев|плат|баланс|денег|отправ|ошибка|error|failed|cannot|can't|limit|cooldown|usage|invalid|not found|нельзя|лимит|кулдаун|не найден/i.test(text) ||
+      (target && lower.includes(target)) ||
+      (amountText && compact.includes(amountText))
+    ) {
+      return text;
+    }
+  }
+
+  return chat.length ? normalizeMinecraftText(chat[chat.length - 1]).trim() : '';
 }
 
 function discordInline(value, maxLength = 180) {
@@ -3512,23 +3717,35 @@ function classifyCashoutReply(message, targetNickname, amount = 0) {
 function isTransientBalanceApiError(result) {
   if (!result || result.ok) return false;
   const code = String(result.code || '');
-  return code === 'API_ERROR' || code === 'GAME_BALANCE_TIMEOUT' || /^HTTP_5\d\d$/.test(code);
+  return code === 'API_ERROR' ||
+    code === 'GAME_BALANCE_TIMEOUT' ||
+    code === 'SUSPICIOUS_BALANCE_JUMP' ||
+    code === 'SUSPICIOUS_BALANCE_DROP' ||
+    /^HTTP_5\d\d$/.test(code);
 }
 
 function parseGameBalanceMessage(message, username = '') {
   const text = normalizeMinecraftText(message).replace(/\s+/g, ' ').trim();
   if (!text || text.startsWith('<')) return NaN;
+  if (/^(?:in|out)\s+\$/i.test(text)) return NaN;
+  if (/\b(?:earned|received|income)\b/i.test(text) && !/\bbalance\b/i.test(text)) return NaN;
 
   const target = String(username || '').trim();
+  const amount = '\\$?\\s*([\\d,]+(?:\\.\\d+)?(?:[kmbt])?)\\.?';
   const patterns = [];
   if (target) {
-    patterns.push(new RegExp(`\\b${escapeRegExp(target)}\\s+has\\s+\\$?\\s*([\\d,.]+(?:[kmbt])?)\\b`, 'i'));
+    const escaped = escapeRegExp(target);
+    patterns.push(
+      new RegExp(`\\b${escaped}\\s+(?:has|have)\\s+${amount}`, 'i'),
+      new RegExp(`\\b${escaped}(?:'s)?\\s+(?:balance|bal|money|cash)\\s*(?:is|:|>|»)?\\s*${amount}`, 'i'),
+      new RegExp(`\\b(?:balance|bal|money|cash)\\s+(?:of|for)\\s+${escaped}\\s*(?:is|:|>|»)?\\s*${amount}`, 'i')
+    );
   }
   patterns.push(
-    /\byou\s+have\s+\$?\s*([\d,.]+(?:[kmbt])?)\b/i,
-    /\bbalance\s*[:>»]?\s*\$?\s*([\d,.]+(?:[kmbt])?)\b/i,
-    /\bbal\s*[:>»]?\s*\$?\s*([\d,.]+(?:[kmbt])?)\b/i,
-    /\$\s*([\d,.]+(?:[kmbt])?)\b/i
+    new RegExp(`\\byou\\s+(?:have|own)\\s+${amount}`, 'i'),
+    new RegExp(`\\byour\\s+(?:balance|bal|money|cash)\\s*(?:is|:|>|»)?\\s*${amount}`, 'i'),
+    new RegExp(`\\b(?:balance|bal|money|cash)\\s*(?:is|:|>|»)?\\s*${amount}`, 'i'),
+    new RegExp(`\\b(?:баланс|деньги)\\s*(?:is|:|>|»)?\\s*${amount}`, 'i')
   );
   for (const pattern of patterns) {
     const match = text.match(pattern);

@@ -1493,13 +1493,23 @@ class Dashboard {
     try {
       const cashoutTarget = this.config.cashout_nickname || '';
       if (cashoutTarget) {
-        const gameResult = await this.manager.getGameBalanceForTarget(cashoutTarget);
-        if (gameResult && gameResult.ok && Number.isFinite(gameResult.balance)) {
-          this.targetBalanceLabel = `$${formatCompactMoney(gameResult.balance)}`;
+        const result = await this.manager.donutApi.getBalance(cashoutTarget, { botKey: 'dashboard', displayName: 'Dashboard' });
+        if (result.ok && Number.isFinite(result.balance)) {
+          this.targetBalanceLabel = `$${formatCompactMoney(result.balance)}`;
           this.targetBalanceAt = Date.now();
-          this.logger.info(`Cashout target balance from game command: ${cashoutTarget} ${this.targetBalanceLabel}`);
         } else {
-          this.targetBalanceLabel = '?';
+          const gameResult = isTransientDashboardBalanceApiError(result)
+            ? await this.manager.getGameBalanceForTarget(cashoutTarget)
+            : null;
+          if (gameResult && gameResult.ok && Number.isFinite(gameResult.balance)) {
+            this.targetBalanceLabel = `$${formatCompactMoney(gameResult.balance)}`;
+            this.targetBalanceAt = Date.now();
+            this.logger.info(`Cashout target balance from game command: ${cashoutTarget} ${this.targetBalanceLabel}`);
+          } else if (!this.hasCachedTargetBalanceFor(result)) {
+            this.targetBalanceLabel = '?';
+          } else {
+            this.logger.debug(`Keeping cached cashout target balance during ${result.code || 'API error'}`);
+          }
         }
       } else {
         this.targetBalanceLabel = '-';
