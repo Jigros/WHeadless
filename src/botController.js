@@ -2374,7 +2374,7 @@ class BotController {
         const chatKind = normalizeChatKind(args[1] || '');
         const rawText = normalizeMinecraftText(jsonMsg, { maxDepth: 10 }).trim();
         rememberCashoutChat(payment, rawText, chatKind);
-        const classified = classifyCashoutReply(rawText, cashoutNickname, amount);
+        const classified = classifyCashoutReply(rawText, cashoutNickname, payment.amount || amount);
         if (!classified) return;
         rememberCashoutReply(payment, classified.message || rawText);
         if (classified.type === 'success') payment.success = true;
@@ -2389,40 +2389,42 @@ class BotController {
     this.bot.on('messagestr', replyListener);
     try {
       this.stopAttack(true);
-      this.setStatus('Cashout');
-      this.closeCurrentWindow('before cashout');
-      this.sendChat(`/pay ${cashoutNickname} ${amount}`);
-      this.logger.info(`Cashout sent: /pay ${cashoutNickname} ${amount}${isRecoveryRetry ? ' (recovery retry)' : ''} balanceSource=${before.source}`);
-
       const replyWaitMs = Math.max(1000, Number(this.settings.cashout_reply_wait_ms) || 5000);
-      await sleep(replyWaitMs);
+      const chunks = this.cashoutPaymentPlan(amount);
+      const chunkDelayMs = this.cashoutChunkDelayMs();
+      let acceptedChunks = 0;
 
-      if (payment.error && isTemporaryCashoutFailure(payment.message) && !isRecoveryRetry) {
-        const reason = payment.message || 'temporary server payment error';
-        const retryDelayMs = Math.max(1000, Number(this.settings.cashout_temporary_retry_delay_ms) || 30000);
-        this.logger.warn(`Cashout temporary error; retrying in ${Math.round(retryDelayMs / 1000)}s: ${reason}`);
-        this.closeCurrentWindow('after temporary cashout error');
-        this.manager.dashboard?.sendLog(
-          `⚠️ \`${this.displayName()}\` temporary cashout error; retrying in **${Math.round(retryDelayMs / 1000)}s**. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`
+      if (chunks.length > 1) {
+        this.logger.warn(
+          `Cashout split into ${chunks.length} payments: total=${amount} maxSingle=${this.cashoutMaxSinglePaymentAmount()} chunkDelay=${chunkDelayMs}ms`
         );
-        resetCashoutPaymentForRetry(payment);
-        this.setStatus(`Cashout Retry (${Math.round(retryDelayMs / 1000)}s)`);
-        await sleep(retryDelayMs);
-        if (!this.bot || this.disconnectHandled || this.userPaused) return false;
-
-        this.setStatus('Cashout');
-        this.closeCurrentWindow('before cashout retry');
-        this.sendChat(`/pay ${cashoutNickname} ${amount}`);
-        this.logger.info(`Cashout retry sent after temporary error: /pay ${cashoutNickname} ${amount} balanceSource=${before.source}`);
-        await sleep(replyWaitMs);
       }
 
-      if (payment.error) {
-        const reason = payment.message || 'server rejected payment';
-        this.logger.warn(`Cashout rejected: ${reason}`);
-        this.closeCurrentWindow('after rejected cashout');
-        this.manager.dashboard?.sendLog(`❌ \`${this.displayName()}\` failed to cashout **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`);
-        return false;
+      for (let index = 0; index < chunks.length; index += 1) {
+        const chunkAmount = chunks[index];
+        const sent = await this.sendCashoutPaymentWithRetry(payment, cashoutNickname, chunkAmount, {
+          replyWaitMs,
+          isRecoveryRetry,
+          index,
+          totalChunks: chunks.length,
+          balanceSource: before.source
+        });
+        if (!sent) {
+          const reason = payment.message || latestCashoutChatReason(payment) || 'server rejected payment';
+          this.logger.warn(`Cashout rejected chunk=${index + 1}/${chunks.length} amount=${chunkAmount}: ${reason}`);
+          this.closeCurrentWindow('after rejected cashout');
+          this.manager.dashboard?.sendLog(
+            `❌ \`${this.displayName()}\` failed to cashout **$${amount.toLocaleString('en-US')}** to \`${cashoutNickname}\`. ` +
+            `Chunk: **${index + 1}/${chunks.length}** (**$${chunkAmount.toLocaleString('en-US')}**). Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`
+          );
+          return false;
+        }
+
+        if (payment.success) acceptedChunks += 1;
+        if (index < chunks.length - 1 && chunkDelayMs > 0) {
+          this.setStatus(`Cashout Wait (${Math.round(chunkDelayMs / 1000)}s)`);
+          await sleep(chunkDelayMs);
+        }
       }
 
       const verified = await this.verifyCashoutBalanceDrop(before.balance, amount);
@@ -2439,8 +2441,8 @@ class BotController {
         return false;
       }
 
-      if (payment.success) {
-        this.logger.info(`Cashout accepted by server amount=${amount} target=${cashoutNickname}${payment.message ? ` reply=${payment.message.slice(0, 160)}` : ''}`);
+      if (acceptedChunks === chunks.length) {
+        this.logger.info(`Cashout accepted by server amount=${amount} target=${cashoutNickname} chunks=${chunks.length}${payment.message ? ` reply=${payment.message.slice(0, 160)}` : ''}`);
         this.recordCashoutAcceptedLocally(before.balance, amount);
         return true;
       }
@@ -2457,11 +2459,78 @@ class BotController {
       this.bot?.removeListener('message', replyListener);
       this.bot?.removeListener('messagestr', replyListener);
       if (this.pendingCashout === payment) this.pendingCashout = null;
-      if (this.status === 'Cashout') this.setStatus('Ready');
+      if (String(this.status || '').startsWith('Cashout')) this.setStatus('Ready');
       if (wasFarming && this.bot && !this.disconnectHandled && !this.tpaInProgress) {
         this.startFarming().catch((error) => this.logger.warn(`Failed to restart farming after cashout: ${error.message || error}`));
       }
     }
+  }
+
+  async sendCashoutPaymentWithRetry(payment, target, amount, options = {}) {
+    const replyWaitMs = Math.max(1000, Number(options.replyWaitMs) || Number(this.settings.cashout_reply_wait_ms) || 5000);
+    const retryDelayMs = Math.max(1000, Number(this.settings.cashout_temporary_retry_delay_ms) || 30000);
+    const index = Number(options.index) || 0;
+    const totalChunks = Math.max(1, Number(options.totalChunks) || 1);
+    const chunkLabel = totalChunks > 1 ? ` ${index + 1}/${totalChunks}` : '';
+
+    const sendOnce = async (retry = false) => {
+      resetCashoutPaymentForRetry(payment);
+      payment.target = target;
+      payment.amount = amount;
+      payment.startedAt = Date.now();
+      this.setStatus(retry ? `Cashout Retry${chunkLabel}` : `Cashout${chunkLabel}`);
+      this.closeCurrentWindow(retry ? 'before cashout retry' : 'before cashout');
+      this.sendChat(`/pay ${target} ${amount}`);
+      this.logger.info(
+        `Cashout ${retry ? 'retry ' : ''}sent: /pay ${target} ${amount}${chunkLabel}${options.isRecoveryRetry ? ' (recovery retry)' : ''} balanceSource=${options.balanceSource || '-'}`
+      );
+      await sleep(replyWaitMs);
+    };
+
+    await sendOnce(false);
+    if (payment.error && isTemporaryCashoutFailure(payment.message) && !options.isRecoveryRetry) {
+      const reason = payment.message || 'server refused this payment amount';
+      this.logger.warn(`Cashout payment refused; retrying in ${Math.round(retryDelayMs / 1000)}s amount=${amount}: ${reason}`);
+      this.closeCurrentWindow('after temporary cashout error');
+      this.manager.dashboard?.sendLog(
+        `⚠️ \`${this.displayName()}\` cashout payment **$${amount.toLocaleString('en-US')}** was refused; retrying in **${Math.round(retryDelayMs / 1000)}s**. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`
+      );
+      this.setStatus(`Cashout Retry Wait (${Math.round(retryDelayMs / 1000)}s)`);
+      await sleep(retryDelayMs);
+      if (!this.bot || this.disconnectHandled || this.userPaused) return false;
+      await sendOnce(true);
+    }
+
+    return !payment.error;
+  }
+
+  cashoutPaymentPlan(amount) {
+    const total = Math.max(0, Math.floor(Number(amount) || 0));
+    if (total <= 0) return [];
+    const maxSingle = this.cashoutMaxSinglePaymentAmount();
+    if (!Number.isFinite(maxSingle) || maxSingle <= 0 || total <= maxSingle) return [total];
+
+    const chunks = [];
+    let remaining = total;
+    while (remaining > 0) {
+      const chunk = Math.min(maxSingle, remaining);
+      chunks.push(chunk);
+      remaining -= chunk;
+    }
+    return chunks;
+  }
+
+  cashoutMaxSinglePaymentAmount() {
+    const value = Number(this.settings.cashout_max_single_payment_amount);
+    if (!Number.isFinite(value)) return 20000000;
+    if (value <= 0) return Infinity;
+    return Math.max(1, Math.floor(value));
+  }
+
+  cashoutChunkDelayMs() {
+    const value = Number(this.settings.cashout_chunk_delay_ms);
+    if (!Number.isFinite(value)) return 5000;
+    return Math.max(0, Math.floor(value));
   }
 
   async verifyCashoutBalanceDrop(beforeBalance, amount) {
