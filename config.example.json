@@ -39,6 +39,9 @@
   "proxy": null,
   "bot_defaults": {
     "cashout_reply_wait_ms": 5000,
+    "cashout_temporary_retry_delay_ms": 30000,
+    "cashout_all_stagger_min_ms": 5000,
+    "cashout_all_stagger_max_ms": 20000,
     "cashout_verify_attempts": 6,
     "cashout_verify_interval_ms": 5000,
     "cashout_verify_min_drop_ratio": 0.8,

@@ -187,6 +187,7 @@ class BotController {
     this.homeRecoveryAttemptCount = 0;
     this.homeRecoveryStuckAfterHomeAlerted = false;
     this.homeRecoveryNextStartAllowedAt = 0;
+    this.homeRecoveryChatLines = [];
     this.lastHomeRecoveryDiscordAt = new Map();
     
     this.sessionEarned = 0;
@@ -468,6 +469,7 @@ class BotController {
         this.lastChatWithMyNameTime = Date.now();
       }
       this.handleHomeRecoveryMessage(rawMsg);
+      this.rememberHomeRecoveryChat(rawMsg, position);
       this.handleMessageString(rawMsg);
     });
 
@@ -481,6 +483,8 @@ class BotController {
         this.lastChatWithMyName = rawMsg;
         this.lastChatWithMyNameTime = Date.now();
       }
+      this.handleHomeRecoveryMessage(rawMsg);
+      this.rememberHomeRecoveryChat(rawMsg, position);
       this.handleMessageString(rawMsg);
     });
 
@@ -591,10 +595,49 @@ class BotController {
           Number(this.settings.teleport_wait_ms) ||
           6500
       );
-      await sleep(waitMs);
+      await this.sendHomeCommandAndWait(command, waitMs, 'spawn home');
     } finally {
       this.spawnHomeInProgress = false;
     }
+  }
+
+  async sendHomeCommandAndWait(command, waitMs, context = 'home command') {
+    if (!this.bot || !command) return false;
+    const capturedChat = [];
+    let confirmed = false;
+    const listener = (...args) => {
+      try {
+        const rawText = normalizeMinecraftText(args[0], { maxDepth: 10, maxStrings: 80 }).trim();
+        const chatKind = normalizeChatKind(args[1] || '');
+        rememberHomeCommandChatLine(capturedChat, rawText, chatKind);
+        if (isHomeTeleportSuccessMessage(rawText)) confirmed = true;
+      } catch (error) {}
+    };
+
+    this.bot.on('message', listener);
+    this.bot.on('messagestr', listener);
+    try {
+      this.sendChat(command);
+      await sleep(Math.max(1000, Number(waitMs) || 6500));
+    } finally {
+      this.bot?.removeListener('message', listener);
+      this.bot?.removeListener('messagestr', listener);
+    }
+
+    if (confirmed) {
+      this.markHomeRecoveryMovement();
+      return true;
+    }
+
+    this.notifyHomeCommandMissingConfirmation(command, context, capturedChat);
+    return false;
+  }
+
+  notifyHomeCommandMissingConfirmation(command, context, chatLines = []) {
+    const diagnostic = homeCommandDiagnosticSuffix(chatLines);
+    const message = `Home command ${command} during ${context} did not confirm with "You teleported to your home".${diagnostic ? ` ${diagnostic}` : ' Minecraft chat: no useful lines captured.'}`;
+    this.logger.warn(message);
+    this.manager.dashboard?.sendLog(`⚠️ \`${this.displayName()}\` ${discordInline(message, 900)}`);
   }
 
   async handleResourcePack() {
@@ -1088,8 +1131,11 @@ class BotController {
       if (!this.bot || this.disconnectHandled || this.userPaused) return false;
 
       this.setStatus('Farm Refresh / Home 1');
-      this.sendChat(home1);
-      await sleep(Math.max(1000, Number(this.settings.farm_refresh_home1_wait_ms) || Number(this.settings.teleport_wait_ms) || 6500));
+      await this.sendHomeCommandAndWait(
+        home1,
+        Math.max(1000, Number(this.settings.farm_refresh_home1_wait_ms) || Number(this.settings.teleport_wait_ms) || 6500),
+        'farm refresh home 1'
+      );
       if (!this.bot || this.disconnectHandled || this.userPaused) return false;
 
       this.markHomeRecoveryMovement();
@@ -1603,6 +1649,7 @@ class BotController {
     }
 
     this.stopAttack(true);
+    this.homeRecoveryChatLines = [];
     this.sendChat(command);
     this.homeRecoveryHomeCommandSentAt = Date.now();
     if (!this.homeRecoveryFirstCommandAt) this.homeRecoveryFirstCommandAt = this.homeRecoveryHomeCommandSentAt;
@@ -1611,6 +1658,11 @@ class BotController {
     this.homeRecoveryActionAt = Date.now() + this.getHomeRecoveryCommandWaitMs();
     this.setStatus('Home Recovery / Waiting');
     this.notifyHomeRecovery(`Sent ${command}; waiting for home or maintenance chat. attempt=${this.homeRecoveryAttemptCount}`, false);
+  }
+
+  rememberHomeRecoveryChat(message, kind = '') {
+    if (this.homeRecoveryState !== HOME_RECOVERY.waitHomeResult) return;
+    rememberHomeCommandChatLine(this.homeRecoveryChatLines, message, kind);
   }
 
   getHomeRecoveryCommandWaitMs() {
@@ -1622,19 +1674,24 @@ class BotController {
     this.alertHomeRecoveryStillStuck();
     const minutes = this.nextHomeRecoveryRetryMinutes();
     const label = this.homeRecoveryMaintenanceStartedAt > 0 ? 'Maintenance Retry' : 'Home Retry';
-    this.scheduleHomeRecoveryRetryIn(minutes, label, 'retry');
+    this.scheduleHomeRecoveryRetryIn(minutes, label, 'retry', this.homeRecoveryNoConfirmationDiagnostic());
   }
 
-  scheduleHomeRecoveryRetryIn(minutes, label = 'Home Retry', cooldownKey = 'retry') {
+  scheduleHomeRecoveryRetryIn(minutes, label = 'Home Retry', cooldownKey = 'retry', diagnostic = '') {
     const retryMinutes = Math.max(1, Number(minutes) || 1);
     this.homeRecoveryState = HOME_RECOVERY.delayBeforeHome;
     this.homeRecoveryActionAt = Date.now() + retryMinutes * 60000;
     this.setStatus(`${label} (${retryMinutes}m)`);
     this.notifyHomeRecovery(
-      `Next ${this.normalizedHomeCommand()} retry in ${retryMinutes} minute(s).`,
+      `Next ${this.normalizedHomeCommand()} retry in ${retryMinutes} minute(s).${diagnostic ? ` ${diagnostic}` : ''}`,
       true,
       { cooldownKey, cooldownMs: this.getHomeRecoveryDiscordCooldownMs() }
     );
+  }
+
+  homeRecoveryNoConfirmationDiagnostic() {
+    const diagnostic = homeCommandDiagnosticSuffix(this.homeRecoveryChatLines);
+    return `No confirmation with "You teleported to your home".${diagnostic ? ` ${diagnostic}` : ' Minecraft chat: no useful lines captured.'}`;
   }
 
   alertHomeRecoveryStillStuck() {
@@ -1653,7 +1710,7 @@ class BotController {
     const stuckForMs = Date.now() - (this.homeRecoveryFirstCommandAt || this.homeRecoveryHomeCommandSentAt);
     this.manager.alertCritical(
       this,
-      `Home Recovery: still stuck after ${this.normalizedHomeCommand()}; no recovery confirmed after ${formatDuration(stuckForMs)} and ${this.homeRecoveryAttemptCount} attempt(s)`
+      `Home Recovery: still stuck after ${this.normalizedHomeCommand()}; no recovery confirmed after ${formatDuration(stuckForMs)} and ${this.homeRecoveryAttemptCount} attempt(s). ${this.homeRecoveryNoConfirmationDiagnostic()}`
     );
   }
 
@@ -1703,7 +1760,7 @@ class BotController {
       this.handleHomeRecoveryMaintenance(text);
       return;
     }
-    if (HOME_SUCCESS_MARKERS.some((marker) => lower.includes(marker))) {
+    if (isHomeTeleportSuccessMessage(lower)) {
       this.handleHomeRecoverySuccess(text);
     }
   }
@@ -1799,6 +1856,7 @@ class BotController {
     this.homeRecoveryStuckAfterHomeAlerted = false;
     this.homeRecoverySuppressStuckAlertUntil = 0;
     this.homeRecoveryExpectedRestartUntil = 0;
+    this.homeRecoveryChatLines = [];
   }
 
   normalizedHomeCommand() {
@@ -2338,6 +2396,26 @@ class BotController {
 
       const replyWaitMs = Math.max(1000, Number(this.settings.cashout_reply_wait_ms) || 5000);
       await sleep(replyWaitMs);
+
+      if (payment.error && isTemporaryCashoutFailure(payment.message) && !isRecoveryRetry) {
+        const reason = payment.message || 'temporary server payment error';
+        const retryDelayMs = Math.max(1000, Number(this.settings.cashout_temporary_retry_delay_ms) || 30000);
+        this.logger.warn(`Cashout temporary error; retrying in ${Math.round(retryDelayMs / 1000)}s: ${reason}`);
+        this.closeCurrentWindow('after temporary cashout error');
+        this.manager.dashboard?.sendLog(
+          `⚠️ \`${this.displayName()}\` temporary cashout error; retrying in **${Math.round(retryDelayMs / 1000)}s**. Reason: \`${discordInline(reason, 180)}\`${this.cashoutDiagnosticSuffix(payment)}`
+        );
+        resetCashoutPaymentForRetry(payment);
+        this.setStatus(`Cashout Retry (${Math.round(retryDelayMs / 1000)}s)`);
+        await sleep(retryDelayMs);
+        if (!this.bot || this.disconnectHandled || this.userPaused) return false;
+
+        this.setStatus('Cashout');
+        this.closeCurrentWindow('before cashout retry');
+        this.sendChat(`/pay ${cashoutNickname} ${amount}`);
+        this.logger.info(`Cashout retry sent after temporary error: /pay ${cashoutNickname} ${amount} balanceSource=${before.source}`);
+        await sleep(replyWaitMs);
+      }
 
       if (payment.error) {
         const reason = payment.message || 'server rejected payment';
@@ -3156,8 +3234,11 @@ class BotController {
       this.setStatus('Waiting Return');
       await sleep(Number(this.settings.teleport_wait_ms) || 1000);
 
-      this.sendChat(this.settings.home_farm_command);
-      await sleep(Number(this.settings.teleport_wait_ms) || 1000);
+      await this.sendHomeCommandAndWait(
+        this.settings.home_farm_command,
+        Number(this.settings.teleport_wait_ms) || 1000,
+        `TPA return from ${sender}`
+      );
       if (!this.tpaAcceptedNotified && !this.tpaFailureNotified) {
         this.logger.warn(`TPA workflow for ${sender} had no server confirmation after return home; reconnect disabled`);
         this.notifyTpaNoConfirmation(sender, tpaStartedAt);
@@ -3366,6 +3447,53 @@ function rememberCashoutReply(payment, message) {
   if (!Array.isArray(payment.replies)) payment.replies = [];
   if (payment.replies[payment.replies.length - 1] !== text) payment.replies.push(text.slice(0, 500));
   if (payment.replies.length > 12) payment.replies.splice(0, payment.replies.length - 12);
+}
+
+function isTemporaryCashoutFailure(message) {
+  const text = normalizeMinecraftText(message).toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes('cannot process') ||
+    text.includes('can not process') ||
+    text.includes('at the moment') ||
+    text.includes('try again') ||
+    text.includes('temporarily') ||
+    text.includes('temporary') ||
+    text.includes('currently unable')
+  );
+}
+
+function resetCashoutPaymentForRetry(payment) {
+  if (!payment) return;
+  payment.success = false;
+  payment.error = false;
+  payment.message = '';
+  payment.replies = [];
+  payment.chat = [];
+  payment.startedAt = Date.now();
+}
+
+function isHomeTeleportSuccessMessage(message) {
+  const lower = normalizeMinecraftText(message).toLowerCase();
+  return HOME_SUCCESS_MARKERS.some((marker) => lower.includes(marker));
+}
+
+function rememberHomeCommandChatLine(lines, message, kind = '') {
+  if (!Array.isArray(lines)) return;
+  const text = normalizeMinecraftText(message).trim();
+  if (!text) return;
+  const chatKind = normalizeChatKind(kind);
+  if (!shouldShowMinecraftChatLine({ direction: 'IN', text, kind: chatKind })) return;
+  if (lines[lines.length - 1] !== text) lines.push(text.slice(0, 500));
+  if (lines.length > 12) lines.splice(0, lines.length - 12);
+}
+
+function homeCommandDiagnosticSuffix(lines) {
+  const shown = (Array.isArray(lines) ? lines : [])
+    .map((line) => discordInline(line, 160))
+    .filter(Boolean)
+    .slice(-5);
+  return shown.length ? `Minecraft chat: ${shown.map((line) => `\`${line}\``).join(' | ')}` : '';
 }
 
 function rememberGameBalanceChatLine(lines, message, kind = '') {
@@ -3599,7 +3727,13 @@ function parseTpaSender(message) {
 }
 
 function looksLikeTpaMessage(message) {
-  return /teleport|tpa|tpaccept|телепорт/i.test(normalizeMinecraftText(message));
+  const text = normalizeMinecraftText(message).toLowerCase();
+  return (
+    /\btpa\b|\/tpaccept|\btpaccept\b/.test(text) ||
+    /\bteleport request\b|\brequested to teleport\b|\bwants to teleport\b|\bsent you a teleport request\b/.test(text) ||
+    /\bteleport\b.{0,40}\baccepted\b|\baccepted\b.{0,40}\bteleport\b/.test(text) ||
+    /(?:просит|хочет|запрос).{0,80}телепорт|телепорт.{0,80}(?:запрос|принят|принял)/.test(text)
+  );
 }
 
 function isTpaAcceptedMessage(lowerMessage) {
@@ -3648,8 +3782,6 @@ function classifyCashoutReply(message, targetNickname, amount = 0) {
   const amountText = Number.isFinite(Number(amount)) && Number(amount) > 0 ? String(Math.floor(Number(amount))) : '';
   const mentionsAmount = amountText ? text.replace(/[,\s]/g, '').includes(amountText) : false;
   const looksPaymentRelated = /pay|paid|payment|transfer|sent|balance|money|cash|\$|донат|перев|плат|баланс|денег|отправ/i.test(text);
-  if (!looksPaymentRelated && !mentionsTarget && !mentionsAmount) return null;
-
   const errorMarkers = [
     'cannot',
     'error',
@@ -3687,7 +3819,14 @@ function classifyCashoutReply(message, targetNickname, amount = 0) {
     'истёк',
     'отключ'
   ];
-  if (errorMarkers.some((marker) => lower.includes(marker))) {
+  const hasErrorMarker = errorMarkers.some((marker) => lower.includes(marker));
+  const looksGenericCashoutFailure = hasErrorMarker &&
+    /\b(?:process|processed|transaction|moment|currently|temporary|temporarily|try again|unable)\b/i.test(text) &&
+    /\b(?:sorry|cannot|can't|unable|failed|error|try again)\b/i.test(text);
+
+  if (!looksPaymentRelated && !mentionsTarget && !mentionsAmount && !looksGenericCashoutFailure) return null;
+
+  if (hasErrorMarker) {
     return { type: 'error', message: text };
   }
 

@@ -7,7 +7,7 @@ const { BotController } = require('./botController');
 const { Dashboard } = require('./dashboard');
 const { DonutApi } = require('./donutApi');
 const { getProxyLabel } = require('./proxy');
-const { formatCompactMoney, formatDuration, writeJsonFile } = require('./utils');
+const { formatCompactMoney, formatDuration, randomInt, sleep, writeJsonFile } = require('./utils');
 
 class Manager {
   constructor(config, logger) {
@@ -214,7 +214,21 @@ class Manager {
   }
 
   async cashoutAll() {
-    const results = await Promise.allSettled(this.controllers.map((controller) => controller.cashout()));
+    const minDelay = Math.max(0, Number(this.config.bot_defaults.cashout_all_stagger_min_ms) || 5000);
+    const maxDelay = Math.max(minDelay, Number(this.config.bot_defaults.cashout_all_stagger_max_ms) || 20000);
+    let offsetMs = 0;
+    const tasks = this.controllers.map((controller, index) => {
+      if (index > 0) offsetMs += randomInt(minDelay, maxDelay);
+      const delayMs = offsetMs;
+      return (async () => {
+        if (delayMs > 0) {
+          this.logger.info(`Cashout all: delaying ${controller.displayName()} for ${Math.round(delayMs / 1000)}s`);
+          await sleep(delayMs);
+        }
+        return controller.cashout();
+      })();
+    });
+    const results = await Promise.allSettled(tasks);
     return results.filter((result) => result.status === 'fulfilled' && result.value).length;
   }
 
